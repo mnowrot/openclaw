@@ -61,6 +61,12 @@ const MAX_REALTIME_MESSAGE_BYTES = 256 * 1024;
 const MAX_REALTIME_WS_BUFFERED_BYTES = 1024 * 1024;
 const REALTIME_MEDIA_INACTIVITY_TIMEOUT_MS = 30_000;
 const REALTIME_DISCONNECT_HANGUP_GRACE_MS = 2_000;
+// The model invokes end_call in the same turn it speaks its farewell, so the closing
+// line is still streaming when the tool call arrives. Give it a bounded window to reach
+// the line before the carrier is torn down, plus a short settle tail after the last chunk.
+const REALTIME_END_CALL_DRAIN_TIMEOUT_MS = 8_000;
+const END_CALL_OUTPUT_GRACE_MS = 1_500;
+const END_CALL_ASSISTANT_QUIET_MS = 600;
 const FORCED_CONSULT_FALLBACK_DELAY_MS = 200;
 const FORCED_CONSULT_NATIVE_DEDUPE_MS = 2_000;
 const FORCED_CONSULT_RESULT_MAX_CHARS = 1800;
@@ -326,7 +332,10 @@ type RealtimeTelephonyBinding = {
   bridge: ActiveRealtimeVoiceBridge;
   acknowledgeCarrierMark: (markName?: string) => void;
   close: (cause: RealtimeCallEndCause) => Promise<void>;
-  endCall: () => void;
+  endCall: () => Promise<void>;
+  // Lets the end-call tool hold the carrier open until the in-flight farewell audio has
+  // actually reached the line instead of cutting it off a few syllables in.
+  drainPendingAudio?: () => Promise<void>;
   noteMediaActivity: () => void;
   retire: () => void;
 };
@@ -994,6 +1003,7 @@ export class RealtimeCallHandler {
     const nativeConsultOwner: { current?: ActiveRealtimeVoiceBridge } = {};
     let provisionalCloseReason: RealtimeVoiceCloseReason | undefined;
     let sessionClosed = false;
+    let lastAssistantAudioSentAt = 0;
     // Provisional ownership accepts callbacks fired during createBridge. Commit
     // retires the predecessor only after creation succeeds; failure restores it.
     const userTranscriptAdoption = this.beginUserTranscriptOwnerAdoption(callId);
@@ -1093,6 +1103,7 @@ export class RealtimeCallHandler {
         sendAudio: (muLaw, metadata) => {
           harness.recordOutputAudio(muLaw);
           audioPacer.sendAudio(muLaw, metadata);
+          lastAssistantAudioSentAt = Date.now();
         },
         // Telephony pacing knows what actually reached the line; the provider's
         // inbound media clock can run far ahead of playout.
@@ -1502,6 +1513,30 @@ export class RealtimeCallHandler {
       this.trackShutdownWork(bindingClosePromise, this.terminationAttempts);
       return bindingClosePromise;
     };
+    const drainPendingAudioBeforeHangup = async (): Promise<void> => {
+      const deadline = Date.now() + REALTIME_END_CALL_DRAIN_TIMEOUT_MS;
+      let emptyChecks = 0;
+      try {
+        const graceUntil = Math.min(deadline, Date.now() + END_CALL_OUTPUT_GRACE_MS);
+        while (Date.now() < graceUntil) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        while (Date.now() < deadline && emptyChecks < 4) {
+          const assistantQuiet =
+            Date.now() - lastAssistantAudioSentAt >= END_CALL_ASSISTANT_QUIET_MS;
+          if (audioPacer.hasPendingAudio() || !assistantQuiet) {
+            emptyChecks = 0;
+          } else {
+            emptyChecks += 1;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+      } catch (error) {
+        console.warn(
+          `[voice-call] end-call audio drain failed callId=${callId}: ${formatErrorMessage(error)}`,
+        );
+      }
+    };
     const telephonyBinding: RealtimeTelephonyBinding = {
       bridge: session,
       acknowledgeCarrierMark: (markName) => {
@@ -1518,7 +1553,8 @@ export class RealtimeCallHandler {
         }
       },
       close: (cause) => closeBinding(telephonyBinding, cause),
-      endCall: () => {
+      endCall: async () => {
+        await drainPendingAudioBeforeHangup();
         // Close the provider session before the carrier socket so no pending
         // response can reach the caller after the hang-up request succeeds.
         void closeBinding(telephonyBinding);
@@ -1526,6 +1562,7 @@ export class RealtimeCallHandler {
           ws.close(1000, "Call ended");
         }
       },
+      drainPendingAudio: drainPendingAudioBeforeHangup,
       noteMediaActivity: () => {
         if (
           bindingClosed ||
@@ -2055,6 +2092,14 @@ export class RealtimeCallHandler {
       !this.isActiveBridgeOwner(params.callId, params.bridge)
     ) {
       return;
+    }
+
+    // The model invokes end_call in the same turn it speaks the farewell, so the closing
+    // line may still be streaming. Hold the carrier open until the in-flight audio has
+    // drained (bounded) before tearing the call down, otherwise the farewell is cut off
+    // after a couple of syllables.
+    if (typeof binding.drainPendingAudio === "function") {
+      await binding.drainPendingAudio();
     }
 
     let result: { success: boolean; error?: string };
