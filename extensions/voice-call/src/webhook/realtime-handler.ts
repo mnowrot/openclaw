@@ -61,6 +61,9 @@ const MAX_REALTIME_MESSAGE_BYTES = 256 * 1024;
 const MAX_REALTIME_WS_BUFFERED_BYTES = 1024 * 1024;
 const REALTIME_MEDIA_INACTIVITY_TIMEOUT_MS = 30_000;
 const REALTIME_DISCONNECT_HANGUP_GRACE_MS = 2_000;
+// The closing line is spoken in the same turn as the end-call tool call, and its transcript can
+// land a moment after the tool call, so the gate waits this long before deciding it is missing.
+const REALTIME_END_CALL_SETTLE_MS = 4_000;
 const FORCED_CONSULT_FALLBACK_DELAY_MS = 200;
 const FORCED_CONSULT_NATIVE_DEDUPE_MS = 2_000;
 const FORCED_CONSULT_RESULT_MAX_CHARS = 1800;
@@ -388,6 +391,8 @@ export class RealtimeCallHandler {
   private readonly activeBridgesByCallId = new Map<string, ActiveRealtimeVoiceBridge>();
   private readonly activeTelephonyBindingsByCallId = new Map<string, RealtimeTelephonyBinding>();
   private readonly userTranscriptStatesByCallId = new Map<string, UserTranscriptState>();
+  private readonly lastAssistantSpeechByCallId = new Map<string, string>();
+  private readonly endCallClosingRefusalsByCallId = new Map<string, number>();
   private readonly forcedConsultsByCallId = new Map<string, ForcedConsultState>();
   private readonly consultSessionsByCallId = new Map<string, RealtimeConsultSession>();
   private readonly nativeConsultsInFlightByCallId = new Map<string, NativeConsultState>();
@@ -1226,6 +1231,7 @@ export class RealtimeCallHandler {
             transcript: text,
           })
           .then(() => {});
+        this.lastAssistantSpeechByCallId.set(callId, text);
         void transcriptPersistence.catch(reportTranscriptFailure);
       },
       onToolCall: async (toolEvent, sessionLocal) => {
@@ -1357,6 +1363,8 @@ export class RealtimeCallHandler {
         if (ownsCallState) {
           void closeBinding(telephonyBinding, reason);
         }
+        this.lastAssistantSpeechByCallId.delete(callId);
+        this.endCallClosingRefusalsByCallId.delete(callId);
         this.streamDisconnectLifecycle.retire(callSid, streamSid);
         if (ws.readyState === WebSocket.OPEN) {
           ws.close(reason === "error" ? 1011 : 1000, "Bridge disconnected");
@@ -2048,6 +2056,46 @@ export class RealtimeCallHandler {
     turnId: string;
     harness: RealtimeVoiceSessionHarness;
   }): Promise<void> {
+    // The model speaks its closing line in the same turn that it invokes end_call, and the
+    // assistant transcript for that farewell lands just *after* the tool call arrives. Reading
+    // only the last known sentence let the gate see the previous turn, refuse, and have the model
+    // apologise a second time - every call then ended on a doubled farewell. Give the in-flight
+    // transcript a bounded settle window before deciding the closing line is genuinely missing.
+    const closingRefusals = this.endCallClosingRefusalsByCallId.get(params.callId) ?? 0;
+    let lastSpoken = this.lastAssistantSpeechByCallId.get(params.callId);
+    const hasClosingLine = (value: string | undefined): boolean =>
+      Boolean(value && /\bgoodbye\b/i.test(value));
+    if (closingRefusals < 1 && !hasClosingLine(lastSpoken)) {
+      const settleDeadline = Date.now() + REALTIME_END_CALL_SETTLE_MS;
+      while (Date.now() < settleDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        lastSpoken = this.lastAssistantSpeechByCallId.get(params.callId);
+        if (hasClosingLine(lastSpoken)) {
+          break;
+        }
+      }
+      console.log(
+        `[voice-call] realtime end_call closing-line settle callId=${params.callId} foundGoodbye=${hasClosingLine(lastSpoken)}`,
+      );
+    }
+    if (closingRefusals < 1 && !hasClosingLine(lastSpoken)) {
+      this.endCallClosingRefusalsByCallId.set(params.callId, closingRefusals + 1);
+      const closingToolResult = {
+        error: `The call cannot be ended yet: your last spoken sentence did not end with the required closing line. Say exactly one short sentence that apologises plainly and ends with the word "Goodbye.", then call ${REALTIME_VOICE_END_CALL_TOOL_NAME} again.`,
+      };
+      console.warn(
+        `[voice-call] realtime end_call refused: closing line missing callId=${params.callId} lastSpokenChars=${lastSpoken ? lastSpoken.length : 0} refusals=${closingRefusals + 1}`,
+      );
+      await params.bridge.submitToolResult(params.bridgeCallId, closingToolResult);
+      params.harness.emit({
+        type: "tool.error",
+        turnId: params.turnId,
+        callId: params.bridgeCallId,
+        payload: { name: REALTIME_VOICE_END_CALL_TOOL_NAME, result: closingToolResult },
+        final: true,
+      });
+      return;
+    }
     const binding = this.activeTelephonyBindingsByCallId.get(params.callId);
     if (
       !binding ||
