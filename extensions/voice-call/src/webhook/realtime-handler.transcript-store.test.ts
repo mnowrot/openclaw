@@ -234,6 +234,32 @@ describe("RealtimeCallHandler stored dialogue", () => {
     ]);
   });
 
+  it("keeps a later stored caller turn out of the flush after an earlier write fails", async () => {
+    const dialogue = await startDialogue({ transcript: "okay", mode: "fail" });
+    dialogue.callbacks.onTranscript?.("user", "yes", false);
+    dialogue.callbacks.onTranscript?.("assistant", "First reply", true);
+    dialogue.callbacks.onTranscript?.("user", "okay", false);
+    dialogue.callbacks.onTranscript?.("assistant", "Second reply", true);
+    dialogue.callbacks.onTranscript?.("user", "goodbye", false);
+    dialogue.callbacks.onTranscript?.("assistant", "Third reply", true);
+    await dialogue.gateReached;
+
+    closeLikeGoogleLive(dialogue.callbacks, "yes okay goodbye");
+    dialogue.release();
+    expect(await dialogue.close()).toBe(gateFailure);
+
+    expect(await dialogue.readStoredTranscript()).toEqual([
+      ["user", "yes"],
+      ["bot", "First reply"],
+      ["bot", "Second reply"],
+      ["user", "goodbye"],
+      ["bot", "Third reply"],
+      // "goodbye" was stored when it arrived, so the flush recovers only the failed turn,
+      // which therefore lands after it.
+      ["user", "okay"],
+    ]);
+  });
+
   it("reduces the Google Live flush against a caller write still pending at close", async () => {
     const dialogue = await startDialogue({ transcript: "yes", mode: "hold" });
     dialogue.callbacks.onTranscript?.("user", "yes", false);

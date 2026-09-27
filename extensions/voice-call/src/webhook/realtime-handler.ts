@@ -167,11 +167,18 @@ function limitPartialUserTranscript(text: string): string {
   return tail.replace(/^\S+\s+/, "").trimStart() || tail.trimStart();
 }
 
-/** One caller turn already written to the store, tracked for end-of-call dedupe. */
-type CallerTurnCommit = { text: string; omittedPrefixChars: number };
+/**
+ * One caller turn issued to the store, tracked for end-of-call dedupe. `unstored` marks a
+ * turn whose write failed: it keeps its ledger slot so later turns still align, and the
+ * final that restates it carries its text instead.
+ */
+type CallerTurnCommit = { text: string; omittedPrefixChars: number; unstored?: boolean };
 
-/** New caller speech in an incoming final, plus how many committed turns it restated. */
-type CallerFinalReduction = { residual: string; claimedTurns: number };
+/**
+ * New caller speech in an incoming final, plus how many committed turns it restated and
+ * the text of restated turns whose own write failed.
+ */
+type CallerFinalReduction = { residual: string; claimedTurns: number; recovered: string[] };
 
 function compactTranscriptText(value: string): string {
   return value.toLowerCase().replaceAll(/\s/g, "");
@@ -196,7 +203,7 @@ function reduceFinalCallerTranscript(
 ): CallerFinalReduction {
   const source = normalizeTranscriptText(incoming);
   if (!source) {
-    return { residual: "", claimedTurns: 0 };
+    return { residual: "", claimedTurns: 0, recovered: [] };
   }
   let compact = "";
   const indexByCompact: number[] = [];
@@ -209,10 +216,11 @@ function reduceFinalCallerTranscript(
     indexByCompact.push(index);
   }
   if (!compact) {
-    return { residual: "", claimedTurns: 0 };
+    return { residual: "", claimedTurns: 0, recovered: [] };
   }
   let matched = 0;
   let claimedTurns = 0;
+  const recovered: string[] = [];
   for (const commit of committed) {
     const commitCompact = compactTranscriptText(commit.text);
     // A bounded turn contains only its tail. Match it at the original offset so
@@ -223,12 +231,19 @@ function reduceFinalCallerTranscript(
     }
     matched = start + commitCompact.length;
     claimedTurns += 1;
+    if (commit.unstored) {
+      recovered.push(commit.text);
+    }
   }
   if (claimedTurns === 0) {
-    return { residual: source, claimedTurns: 0 };
+    return { residual: source, claimedTurns: 0, recovered };
   }
   const position = indexByCompact[matched];
-  return { residual: position === undefined ? "" : source.slice(position).trim(), claimedTurns };
+  return {
+    residual: position === undefined ? "" : source.slice(position).trim(),
+    claimedTurns,
+    recovered,
+  };
 }
 
 function withFallbackConsultQuestion(args: unknown, fallback: string | undefined): unknown {
@@ -1010,14 +1025,6 @@ export class RealtimeCallHandler {
       committedCallerTurns.push(commit);
       return commit;
     };
-    // Removed by identity, so concurrent turn writes that fail out of order still release
-    // their own text.
-    const releaseCommittedCallerTurn = (commit: CallerTurnCommit): void => {
-      const index = committedCallerTurns.indexOf(commit);
-      if (index >= 0) {
-        committedCallerTurns.splice(index, 1);
-      }
-    };
     let transcriptFailure: { error: unknown } | undefined;
     const reportTranscriptFailure = (error: unknown) => {
       transcriptFailure ??= { error };
@@ -1213,14 +1220,17 @@ export class RealtimeCallHandler {
           const generation = continuityGeneration;
           // A provider that restates the call in this final has to be reduced to the
           // suffix no turn write has claimed. Turn writes hold a ledger slot from the
-          // moment they are issued and release it only if they fail, so the ledger is
-          // authoritative as soon as none are in flight.
+          // moment they are issued and mark it unstored only if they fail, so the ledger
+          // is authoritative as soon as none are in flight.
           const flushResidualCallerText = async () => {
             const reduction = reduceFinalCallerTranscript(committedCallerTurns, transcript);
             // Claim only the turns this final restated: a later utterance repeating an
             // earlier phrase must still be stored as new speech.
             committedCallerTurns.splice(0, reduction.claimedTurns);
-            const residualTranscript = reduction.residual;
+            // Restated turns whose own write failed land here, once, ahead of the new speech.
+            const residualTranscript = [...reduction.recovered, reduction.residual]
+              .filter(Boolean)
+              .join(" ");
             this.setRecentFinalUserTranscript(callId, userTranscriptOwner, residualTranscript);
             console.log(
               `[voice-call] realtime input transcript callId=${callId} providerCallId=${callSid} final=true chars=${text.trim().length} aggregateChars=${transcript.length} residualChars=${residualTranscript.length}`,
@@ -1300,9 +1310,10 @@ export class RealtimeCallHandler {
               isFinal: true,
             }),
           ).catch((error: unknown) => {
-            // The turn never landed, so drop it from the ledger and let the provider's
-            // end-of-call flush carry the text rather than losing the turn entirely.
-            releaseCommittedCallerTurn(commit);
+            // The turn never landed. Keep its ledger slot so later stored turns still align
+            // against the provider's cumulative flush, and let that flush carry its text
+            // rather than losing the turn entirely.
+            commit.unstored = true;
             throw error;
           });
           pendingCallerTurnWrites += 1;
