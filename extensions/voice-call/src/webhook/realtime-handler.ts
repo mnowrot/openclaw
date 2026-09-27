@@ -167,6 +167,9 @@ function limitPartialUserTranscript(text: string): string {
   return tail.replace(/^\S+\s+/, "").trimStart() || tail.trimStart();
 }
 
+/** One caller turn already written to the store, tracked for end-of-call dedupe. */
+type CallerTurnCommit = { text: string };
+
 function compactTranscriptText(value: string): string {
   return value.toLowerCase().replaceAll(/\s/g, "");
 }
@@ -370,7 +373,7 @@ export class RealtimeCallHandler {
   private readonly activeBridgesByCallId = new Map<string, ActiveRealtimeVoiceBridge>();
   private readonly activeTelephonyBindingsByCallId = new Map<string, RealtimeTelephonyBinding>();
   private readonly userTranscriptStatesByCallId = new Map<string, UserTranscriptState>();
-  private readonly callerTurnCommitsByCallId = new Map<string, string>();
+  private readonly callerTurnCommitsByCallId = new Map<string, CallerTurnCommit[]>();
   private readonly forcedConsultsByCallId = new Map<string, ForcedConsultState>();
   private readonly consultSessionsByCallId = new Map<string, RealtimeConsultSession>();
   private readonly nativeConsultsInFlightByCallId = new Map<string, NativeConsultState>();
@@ -968,10 +971,31 @@ export class RealtimeCallHandler {
     const userTranscriptAdoption = this.beginUserTranscriptOwnerAdoption(callId);
     const userTranscriptOwner = userTranscriptAdoption.owner;
     let transcriptPersistence = Promise.resolve();
+    // The end-of-call flush reads the committed-caller ledger, so it has to know whether
+    // any turn write is still deciding whether it belongs there.
+    let callerTurnWrites = Promise.resolve();
+    let pendingCallerTurnWrites = 0;
     let transcriptFailure: { error: unknown } | undefined;
     const reportTranscriptFailure = (error: unknown) => {
       transcriptFailure ??= { error };
       console.error("[voice-call] Failed to persist realtime transcript:", error);
+    };
+    /**
+     * Join a manager write into the tracked persistence promise. The manager
+     * serializes `processEvent` through its keyed mutation queue, so the store
+     * applies writes in the order they are issued; callers must not await one
+     * write before issuing the next. Shutdown has to wait for every issued
+     * write, so accumulate them instead of replacing the tracked promise with
+     * the latest one. Failures are recorded here and never rejected onward.
+     */
+    const trackTranscriptWrite = (write: Promise<unknown>): void => {
+      const settled = write.then(
+        () => undefined,
+        (error: unknown) => {
+          reportTranscriptFailure(error);
+        },
+      );
+      transcriptPersistence = Promise.all([transcriptPersistence, settled]).then(() => undefined);
     };
     const drainProviderClose = async (closeProvider: () => void | Promise<void>) => {
       const failures: unknown[] = [];
@@ -1143,24 +1167,31 @@ export class RealtimeCallHandler {
             final: text,
           });
           this.clearPartialUserTranscript(callId, userTranscriptOwner);
-          const committedCallerText = this.callerTurnCommitsByCallId.get(callId) ?? "";
-          this.callerTurnCommitsByCallId.delete(callId);
-          const residualTranscript = stripCommittedCallerPrefix(committedCallerText, transcript);
-          this.setRecentFinalUserTranscript(callId, userTranscriptOwner, residualTranscript);
-          console.log(
-            `[voice-call] realtime input transcript callId=${callId} providerCallId=${callSid} final=true chars=${text.trim().length} aggregateChars=${transcript.length} residualChars=${residualTranscript.length}`,
-          );
-          const event: NormalizedEvent = {
-            id: `realtime-speech-${callSid}-${randomUUID()}`,
-            type: "call.speech",
-            callId,
-            providerCallId: callSid,
-            timestamp: Date.now(),
-            transcript: residualTranscript,
-            isFinal: true,
-          };
           const generation = continuityGeneration;
-          transcriptPersistence = this.manager.processEvent(event).then(() => {
+          // This provider flush restates the whole call, so it must be reduced to the
+          // suffix no turn write has claimed. Turn writes hold a ledger slot from the
+          // moment they are issued and release it only if they fail, so the ledger is
+          // authoritative as soon as none are in flight.
+          const flushResidualCallerText = async () => {
+            const residualTranscript = stripCommittedCallerPrefix(
+              this.readCommittedCallerTurns(callId),
+              transcript,
+            );
+            this.callerTurnCommitsByCallId.delete(callId);
+            this.setRecentFinalUserTranscript(callId, userTranscriptOwner, residualTranscript);
+            console.log(
+              `[voice-call] realtime input transcript callId=${callId} providerCallId=${callSid} final=true chars=${text.trim().length} aggregateChars=${transcript.length} residualChars=${residualTranscript.length}`,
+            );
+            const event: NormalizedEvent = {
+              id: `realtime-speech-${callSid}-${randomUUID()}`,
+              type: "call.speech",
+              callId,
+              providerCallId: callSid,
+              timestamp: Date.now(),
+              transcript: residualTranscript,
+              isFinal: true,
+            };
+            await this.manager.processEvent(event);
             if (
               !residualTranscript ||
               handlesAgentConsult ||
@@ -1185,41 +1216,64 @@ export class RealtimeCallHandler {
                 );
               },
             });
-          });
-          void transcriptPersistence.catch(reportTranscriptFailure);
+          };
+          // With nothing in flight the ledger is already settled, so issue the flush in this
+          // tick: callers observe the flush write before the next provider turn, and awaiting
+          // an already-resolved chain first would push it a microtask later. Only a turn write
+          // still in flight is worth waiting for, because the ledger is not settled until it
+          // decides whether its text belongs there.
+          trackTranscriptWrite(
+            pendingCallerTurnWrites > 0
+              ? callerTurnWrites.then(flushResidualCallerText)
+              : flushResidualCallerText(),
+          );
           return;
         }
         const pendingCallerTurn = this.takeCallerTurnCommitText(callId, userTranscriptOwner);
-        // Settle any earlier rejection before chaining this independent event, so one failed
-        // write cannot skip every later caller/assistant write for the rest of the call.
-        transcriptPersistence = transcriptPersistence
-          .catch(reportTranscriptFailure)
-          .then(async () => {
-            if (pendingCallerTurn) {
-              await this.manager.processEvent({
-                id: `realtime-caller-turn-${callSid}-${randomUUID()}`,
-                type: "call.speech",
-                callId,
-                providerCallId: callSid,
-                timestamp: Date.now(),
-                transcript: pendingCallerTurn,
-                isFinal: true,
-              });
-              // Only mark committed after the write succeeds; a failed write leaves the text
-              // available to the provider's end-of-call flush instead of dropping it.
-              this.recordCommittedCallerTurn(callId, pendingCallerTurn);
-            }
-            await this.manager.processEvent({
-              id: `realtime-bot-${callSid}-${randomUUID()}`,
-              type: "call.assistant-speech",
+        if (pendingCallerTurn) {
+          // Issued before the assistant write so the manager's mutation queue commits this
+          // caller turn ahead of the reply it answered. Awaiting it here instead would both
+          // delay the reply and let one rejection swallow the rest of the call.
+          const commit = this.recordCommittedCallerTurn(callId, pendingCallerTurn);
+          const callerTurnWrite = this.manager
+            .processEvent({
+              id: `realtime-caller-turn-${callSid}-${randomUUID()}`,
+              type: "call.speech",
               callId,
               providerCallId: callSid,
               timestamp: Date.now(),
-              transcript: text,
+              transcript: pendingCallerTurn,
+              isFinal: true,
+            })
+            .catch((error: unknown) => {
+              // The turn never landed, so drop it from the ledger and let the provider's
+              // end-of-call flush carry the text rather than losing the turn entirely.
+              this.releaseCommittedCallerTurn(callId, commit);
+              throw error;
             });
-          })
-          .then(() => {});
-        void transcriptPersistence.catch(reportTranscriptFailure);
+          pendingCallerTurnWrites += 1;
+          const callerTurnSettled = callerTurnWrite
+            .catch(() => undefined)
+            .then(() => {
+              pendingCallerTurnWrites -= 1;
+            });
+          callerTurnWrites = Promise.all([callerTurnWrites, callerTurnSettled]).then(
+            () => undefined,
+          );
+          trackTranscriptWrite(callerTurnWrite);
+        }
+        // Independent of the caller turn above: a rejected caller write must not suppress
+        // the assistant reply that pairs with it.
+        trackTranscriptWrite(
+          this.manager.processEvent({
+            id: `realtime-bot-${callSid}-${randomUUID()}`,
+            type: "call.assistant-speech",
+            callId,
+            providerCallId: callSid,
+            timestamp: Date.now(),
+            transcript: text,
+          }),
+        );
       },
       onToolCall: async (toolEvent, sessionLocal) => {
         const generation = continuityGeneration;
@@ -1705,14 +1759,42 @@ export class RealtimeCallHandler {
   }
 
   /**
-   * Fold a caller turn into the per-call committed-caller ledger. Turns are
-   * concatenated verbatim rather than overlap-deduplicated: a caller may repeat
-   * the same short phrase ("yes", "yes") and both turns must remain, otherwise
-   * the end-of-call flush would re-append the second phrase as a duplicate.
+   * Add a caller turn to the per-call committed-caller ledger as its write is
+   * issued, returning the entry so a failed write can release it again. Turns
+   * are kept verbatim rather than overlap-deduplicated: a caller may repeat the
+   * same short phrase ("yes", "yes") and both turns must remain, otherwise the
+   * end-of-call flush would re-append the second phrase as a duplicate.
    */
-  private recordCommittedCallerTurn(callId: string, text: string): void {
-    const committed = this.callerTurnCommitsByCallId.get(callId) ?? "";
-    this.callerTurnCommitsByCallId.set(callId, committed ? `${committed} ${text}` : text);
+  private recordCommittedCallerTurn(callId: string, text: string): CallerTurnCommit {
+    const commit: CallerTurnCommit = { text };
+    const committed = this.callerTurnCommitsByCallId.get(callId);
+    if (committed) {
+      committed.push(commit);
+    } else {
+      this.callerTurnCommitsByCallId.set(callId, [commit]);
+    }
+    return commit;
+  }
+
+  /**
+   * Drop a caller turn whose write failed. Entries are removed by identity, so
+   * concurrent turn writes that fail out of order still release their own text.
+   */
+  private releaseCommittedCallerTurn(callId: string, commit: CallerTurnCommit): void {
+    const committed = this.callerTurnCommitsByCallId.get(callId);
+    const index = committed?.indexOf(commit) ?? -1;
+    if (!committed || index < 0) {
+      return;
+    }
+    committed.splice(index, 1);
+    if (committed.length === 0) {
+      this.callerTurnCommitsByCallId.delete(callId);
+    }
+  }
+
+  /** Committed caller turns for this call, joined in the order they were issued. */
+  private readCommittedCallerTurns(callId: string): string {
+    return (this.callerTurnCommitsByCallId.get(callId) ?? []).map((entry) => entry.text).join(" ");
   }
 
   private clearUserTranscriptState(callId: string, owner: UserTranscriptState): void {

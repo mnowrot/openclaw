@@ -1,0 +1,187 @@
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import type { RealtimeVoiceBridgeCreateRequest } from "openclaw/plugin-sdk/realtime-voice";
+import { describe, expect, it, vi } from "vitest";
+import { createManagerHarness, FakeProvider, markCallAnswered } from "../manager.test-harness.js";
+import { findCallInStore } from "../manager/store.js";
+import type { NormalizedEvent } from "../types.js";
+import { RealtimeCallHandler } from "./realtime-handler.js";
+import {
+  connectCarrierStream,
+  createBridge,
+  createRealtimeConfig,
+  makeRealtimeProvider,
+  noOpStreamDisconnectLifecycle,
+} from "./realtime-handler.lifecycle.test-helpers.js";
+
+/**
+ * These cases read the persisted transcript rather than the manager mock, because
+ * dialogue order is a property of what the store ends up holding: the handler issues
+ * caller and assistant writes without awaiting each other, and only the manager's
+ * mutation queue decides the order they land in.
+ */
+describe("RealtimeCallHandler stored dialogue", () => {
+  const gateFailure = new Error("caller turn write failed");
+
+  async function startDialogue(gate?: { transcript: string; mode: "hold" | "fail" }): Promise<{
+    callbacks: RealtimeVoiceBridgeCreateRequest;
+    close: () => Promise<unknown>;
+    gateReached: Promise<void>;
+    order: string[];
+    readStoredTranscript: () => Promise<string[][] | undefined>;
+    release: () => void;
+  }> {
+    const { manager, storePath } = await createManagerHarness(
+      { provider: "twilio", realtime: { enabled: true } },
+      new FakeProvider("twilio"),
+    );
+    const started = await manager.initiateCall("+15550000001");
+    expect(started.success).toBe(true);
+    await markCallAnswered(manager, started.callId, "answered-stored-dialogue");
+
+    const order: string[] = [];
+    const released = createDeferred<void>();
+    const gateReached = createDeferred<void>();
+    const realProcessEvent = manager.processEvent.bind(manager);
+    let pendingGate = gate;
+    vi.spyOn(manager, "processEvent").mockImplementation((event: NormalizedEvent) => {
+      const matched = pendingGate;
+      if (!matched || event.type !== "call.speech" || event.transcript !== matched.transcript) {
+        return realProcessEvent(event);
+      }
+      pendingGate = undefined;
+      gateReached.resolve();
+      if (matched.mode === "fail") {
+        // Never reaches the store, so the turn has to be recovered by the end-of-call flush.
+        return released.promise.then(() => {
+          throw gateFailure;
+        });
+      }
+      // Enqueue now so the manager still applies this turn in dialogue order, but leave
+      // the handler's write pending so shutdown has a queued turn write to wait for.
+      const queued = realProcessEvent(event);
+      return released.promise.then(async () => {
+        const result = await queued;
+        order.push("caller-turn-write");
+        return result;
+      });
+    });
+
+    const ready = createDeferred<RealtimeVoiceBridgeCreateRequest>();
+    const realtimeProvider = makeRealtimeProvider((request) => {
+      ready.resolve(request);
+      return createBridge(() => {});
+    });
+    const handler = new RealtimeCallHandler(
+      createRealtimeConfig(),
+      manager,
+      () => ({
+        agentId: "main",
+        instructions: "Be helpful.",
+        provider: realtimeProvider,
+        providerConfig: { apiKey: "test-key" },
+        // Native delegation keeps the forced-consult scheduler out of these cases, so
+        // the only writes under test are the caller turns and their replies.
+        capabilities: {
+          transports: ["gateway-relay" as const],
+          inputAudioFormats: [],
+          outputAudioFormats: [],
+          handlesAgentConsult: true,
+          supportsBargeIn: false,
+          handlesInputAudioBargeIn: false,
+        },
+      }),
+      "/voice/webhook",
+      noOpStreamDisconnectLifecycle,
+    );
+    const { server, ws } = await connectCarrierStream(handler);
+    ws.send(
+      JSON.stringify({
+        event: "start",
+        start: { streamSid: "MZ-stored-dialogue", callSid: "request-uuid" },
+      }),
+    );
+    const callbacks = await ready.promise;
+
+    return {
+      callbacks,
+      close: async () => {
+        const outcome = await handler.close().then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+        order.push("close");
+        ws.terminate();
+        await server.close();
+        return outcome;
+      },
+      gateReached: gateReached.promise,
+      order,
+      readStoredTranscript: async () => {
+        const stored = await findCallInStore(storePath, started.callId);
+        return stored?.transcript.map(({ speaker, text }) => [speaker, text]);
+      },
+      release: () => released.resolve(),
+    };
+  }
+
+  /** Two caller turns, each answered, then the provider's single end-of-call flush. */
+  function speakDialogue(callbacks: RealtimeVoiceBridgeCreateRequest): void {
+    callbacks.onTranscript?.("user", "yes", false);
+    callbacks.onTranscript?.("assistant", "First reply", true);
+    callbacks.onTranscript?.("user", "okay", false);
+    callbacks.onTranscript?.("assistant", "Second reply", true);
+    callbacks.onTranscript?.("user", "yes okay goodbye", true);
+  }
+
+  it("stores each caller turn ahead of the reply it answered", async () => {
+    const dialogue = await startDialogue();
+    speakDialogue(dialogue.callbacks);
+    dialogue.release();
+
+    expect(await dialogue.close()).toBeUndefined();
+    expect(await dialogue.readStoredTranscript()).toEqual([
+      ["user", "yes"],
+      ["bot", "First reply"],
+      ["user", "okay"],
+      ["bot", "Second reply"],
+      // The flush restates the whole call; only its uncommitted suffix is stored.
+      ["user", "goodbye"],
+    ]);
+  });
+
+  it("finishes a queued caller turn write before shutdown completes", async () => {
+    const dialogue = await startDialogue({ transcript: "yes", mode: "hold" });
+    speakDialogue(dialogue.callbacks);
+    await dialogue.gateReached;
+
+    const closing = dialogue.close();
+    dialogue.release();
+    expect(await closing).toBeUndefined();
+
+    expect(dialogue.order).toEqual(["caller-turn-write", "close"]);
+    expect(await dialogue.readStoredTranscript()).toEqual([
+      ["user", "yes"],
+      ["bot", "First reply"],
+      ["user", "okay"],
+      ["bot", "Second reply"],
+      ["user", "goodbye"],
+    ]);
+  });
+
+  it("stores the reply paired with a failed caller turn and recovers that turn at flush", async () => {
+    const dialogue = await startDialogue({ transcript: "okay", mode: "fail" });
+    speakDialogue(dialogue.callbacks);
+    await dialogue.gateReached;
+    dialogue.release();
+
+    expect(await dialogue.close()).toBe(gateFailure);
+    expect(await dialogue.readStoredTranscript()).toEqual([
+      ["user", "yes"],
+      ["bot", "First reply"],
+      // "okay" never reached the store, but its reply is still persisted...
+      ["bot", "Second reply"],
+      // ...and the flush carries the lost turn instead of dropping it.
+      ["user", "okay goodbye"],
+    ]);
+  });
+});
