@@ -1,5 +1,6 @@
 import type { RealtimeVoiceBridgeCreateRequest } from "openclaw/plugin-sdk/realtime-voice";
 import { describe, expect, it, vi } from "vitest";
+import type { RawData } from "ws";
 import {
   connectCarrierStream,
   createBridge,
@@ -136,9 +137,14 @@ describe("RealtimeCallHandler greeting protection", () => {
       const { server, ws } = await connectCarrierStream(handler);
       const outboundMarks: string[] = [];
       try {
-        ws.on("message", (data) => {
+        ws.on("message", (data: RawData) => {
           try {
-            const frame = JSON.parse(data.toString()) as {
+            const bytes = Buffer.isBuffer(data)
+              ? data
+              : Array.isArray(data)
+                ? Buffer.concat(data)
+                : Buffer.from(data);
+            const frame = JSON.parse(bytes.toString("utf8")) as {
               event?: string;
               mark?: { name?: string };
             };
