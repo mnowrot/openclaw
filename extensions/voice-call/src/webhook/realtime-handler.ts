@@ -170,24 +170,33 @@ function limitPartialUserTranscript(text: string): string {
 /** One caller turn already written to the store, tracked for end-of-call dedupe. */
 type CallerTurnCommit = { text: string };
 
+/** New caller speech in an incoming final, plus how many committed turns it restated. */
+type CallerFinalReduction = { residual: string; claimedTurns: number };
+
 function compactTranscriptText(value: string): string {
   return value.toLowerCase().replaceAll(/\s/g, "");
 }
 
 /**
- * Return only the part of an incoming caller transcript that was not already
- * committed by an earlier incremental caller turn. Used at connection close so
- * the provider's single end-of-call flush cannot duplicate committed turns.
- * On any divergence it returns the whole incoming text (over-keep, never drop).
+ * Reduce an incoming caller final against the caller turns this connection has
+ * already written, keeping only text no turn write has claimed.
+ *
+ * Reduction applies solely to a final that restates committed turns from the
+ * start, which is the cumulative-flush contract: Google Live accumulates the
+ * caller's input transcript and flushes all of it when the connection closes, so
+ * that final repeats every turn already stored. A provider that finalizes each
+ * utterance instead restates at most the oldest unclaimed turn, so every final
+ * claims only the turns it actually repeats and a caller who says the same short
+ * phrase twice keeps both turns. Text that does not restate a committed turn is
+ * returned whole (over-keep, never drop).
  */
-function stripCommittedCallerPrefix(committed: string | undefined, incoming: string): string {
+function reduceFinalCallerTranscript(
+  committed: readonly CallerTurnCommit[],
+  incoming: string,
+): CallerFinalReduction {
   const source = normalizeTranscriptText(incoming);
   if (!source) {
-    return "";
-  }
-  const compactCommitted = compactTranscriptText(committed ?? "");
-  if (!compactCommitted) {
-    return source;
+    return { residual: "", claimedTurns: 0 };
   }
   let compact = "";
   const indexByCompact: number[] = [];
@@ -200,16 +209,23 @@ function stripCommittedCallerPrefix(committed: string | undefined, incoming: str
     indexByCompact.push(index);
   }
   if (!compact) {
-    return "";
+    return { residual: "", claimedTurns: 0 };
   }
-  if (compactCommitted.includes(compact)) {
-    return "";
+  let matched = 0;
+  let claimedTurns = 0;
+  for (const commit of committed) {
+    const commitCompact = compactTranscriptText(commit.text);
+    if (!compact.startsWith(commitCompact, matched)) {
+      break;
+    }
+    matched += commitCompact.length;
+    claimedTurns += 1;
   }
-  if (compact.startsWith(compactCommitted)) {
-    const position = indexByCompact[compactCommitted.length];
-    return position === undefined ? "" : source.slice(position).trim();
+  if (claimedTurns === 0) {
+    return { residual: source, claimedTurns: 0 };
   }
-  return source;
+  const position = indexByCompact[matched];
+  return { residual: position === undefined ? "" : source.slice(position).trim(), claimedTurns };
 }
 
 function withFallbackConsultQuestion(args: unknown, fallback: string | undefined): unknown {
@@ -373,7 +389,6 @@ export class RealtimeCallHandler {
   private readonly activeBridgesByCallId = new Map<string, ActiveRealtimeVoiceBridge>();
   private readonly activeTelephonyBindingsByCallId = new Map<string, RealtimeTelephonyBinding>();
   private readonly userTranscriptStatesByCallId = new Map<string, UserTranscriptState>();
-  private readonly callerTurnCommitsByCallId = new Map<string, CallerTurnCommit[]>();
   private readonly forcedConsultsByCallId = new Map<string, ForcedConsultState>();
   private readonly consultSessionsByCallId = new Map<string, RealtimeConsultSession>();
   private readonly nativeConsultsInFlightByCallId = new Map<string, NativeConsultState>();
@@ -975,6 +990,26 @@ export class RealtimeCallHandler {
     // any turn write is still deciding whether it belongs there.
     let callerTurnWrites = Promise.resolve();
     let pendingCallerTurnWrites = 0;
+    // Caller turns this connection has written, so the provider's cumulative flush can be
+    // reduced to text no turn write has claimed. The ledger belongs to the bridge, not the
+    // call: a replacement connection starts its own, and a provider close cannot clear a
+    // ledger a deferred flush still has to read. Turns are kept verbatim rather than
+    // overlap-deduplicated, because a caller may repeat the same short phrase ("yes",
+    // "yes") and both turns have to remain.
+    const committedCallerTurns: CallerTurnCommit[] = [];
+    const recordCommittedCallerTurn = (text: string): CallerTurnCommit => {
+      const commit: CallerTurnCommit = { text };
+      committedCallerTurns.push(commit);
+      return commit;
+    };
+    // Removed by identity, so concurrent turn writes that fail out of order still release
+    // their own text.
+    const releaseCommittedCallerTurn = (commit: CallerTurnCommit): void => {
+      const index = committedCallerTurns.indexOf(commit);
+      if (index >= 0) {
+        committedCallerTurns.splice(index, 1);
+      }
+    };
     let transcriptFailure: { error: unknown } | undefined;
     const reportTranscriptFailure = (error: unknown) => {
       transcriptFailure ??= { error };
@@ -1168,16 +1203,16 @@ export class RealtimeCallHandler {
           });
           this.clearPartialUserTranscript(callId, userTranscriptOwner);
           const generation = continuityGeneration;
-          // This provider flush restates the whole call, so it must be reduced to the
+          // A provider that restates the call in this final has to be reduced to the
           // suffix no turn write has claimed. Turn writes hold a ledger slot from the
           // moment they are issued and release it only if they fail, so the ledger is
           // authoritative as soon as none are in flight.
           const flushResidualCallerText = async () => {
-            const residualTranscript = stripCommittedCallerPrefix(
-              this.readCommittedCallerTurns(callId),
-              transcript,
-            );
-            this.callerTurnCommitsByCallId.delete(callId);
+            const reduction = reduceFinalCallerTranscript(committedCallerTurns, transcript);
+            // Claim only the turns this final restated: a later utterance repeating an
+            // earlier phrase must still be stored as new speech.
+            committedCallerTurns.splice(0, reduction.claimedTurns);
+            const residualTranscript = reduction.residual;
             this.setRecentFinalUserTranscript(callId, userTranscriptOwner, residualTranscript);
             console.log(
               `[voice-call] realtime input transcript callId=${callId} providerCallId=${callSid} final=true chars=${text.trim().length} aggregateChars=${transcript.length} residualChars=${residualTranscript.length}`,
@@ -1234,7 +1269,7 @@ export class RealtimeCallHandler {
           // Issued before the assistant write so the manager's mutation queue commits this
           // caller turn ahead of the reply it answered. Awaiting it here instead would both
           // delay the reply and let one rejection swallow the rest of the call.
-          const commit = this.recordCommittedCallerTurn(callId, pendingCallerTurn);
+          const commit = recordCommittedCallerTurn(pendingCallerTurn);
           const callerTurnWrite = this.manager
             .processEvent({
               id: `realtime-caller-turn-${callSid}-${randomUUID()}`,
@@ -1248,7 +1283,7 @@ export class RealtimeCallHandler {
             .catch((error: unknown) => {
               // The turn never landed, so drop it from the ledger and let the provider's
               // end-of-call flush carry the text rather than losing the turn entirely.
-              this.releaseCommittedCallerTurn(callId, commit);
+              releaseCommittedCallerTurn(commit);
               throw error;
             });
           pendingCallerTurnWrites += 1;
@@ -1404,7 +1439,6 @@ export class RealtimeCallHandler {
         if (ownsCallState) {
           void closeBinding(telephonyBinding, reason);
         }
-        this.callerTurnCommitsByCallId.delete(callId);
         this.streamDisconnectLifecycle.retire(callSid, streamSid);
         if (ws.readyState === WebSocket.OPEN) {
           ws.close(reason === "error" ? 1011 : 1000, "Bridge disconnected");
@@ -1742,9 +1776,9 @@ export class RealtimeCallHandler {
 
   /**
    * Take the caller's pending partial turn text to persist as a committed caller
-   * entry, subtracting it from the live partial buffer. The committed-caller
-   * ledger (used for end-of-call dedupe) is advanced only once the write
-   * succeeds, via {@link recordCommittedCallerTurn}.
+   * entry, subtracting it from the live partial buffer. The bridge's committed-caller
+   * ledger (used to reduce a cumulative provider final) records the turn separately,
+   * as its write is issued.
    */
   private takeCallerTurnCommitText(callId: string, owner: UserTranscriptState): string | undefined {
     const state = this.getUserTranscriptState(callId, owner);
@@ -1756,45 +1790,6 @@ export class RealtimeCallHandler {
       this.consumePartialUserTranscript(callId, owner, state.partial);
     }
     return pending;
-  }
-
-  /**
-   * Add a caller turn to the per-call committed-caller ledger as its write is
-   * issued, returning the entry so a failed write can release it again. Turns
-   * are kept verbatim rather than overlap-deduplicated: a caller may repeat the
-   * same short phrase ("yes", "yes") and both turns must remain, otherwise the
-   * end-of-call flush would re-append the second phrase as a duplicate.
-   */
-  private recordCommittedCallerTurn(callId: string, text: string): CallerTurnCommit {
-    const commit: CallerTurnCommit = { text };
-    const committed = this.callerTurnCommitsByCallId.get(callId);
-    if (committed) {
-      committed.push(commit);
-    } else {
-      this.callerTurnCommitsByCallId.set(callId, [commit]);
-    }
-    return commit;
-  }
-
-  /**
-   * Drop a caller turn whose write failed. Entries are removed by identity, so
-   * concurrent turn writes that fail out of order still release their own text.
-   */
-  private releaseCommittedCallerTurn(callId: string, commit: CallerTurnCommit): void {
-    const committed = this.callerTurnCommitsByCallId.get(callId);
-    const index = committed?.indexOf(commit) ?? -1;
-    if (!committed || index < 0) {
-      return;
-    }
-    committed.splice(index, 1);
-    if (committed.length === 0) {
-      this.callerTurnCommitsByCallId.delete(callId);
-    }
-  }
-
-  /** Committed caller turns for this call, joined in the order they were issued. */
-  private readCommittedCallerTurns(callId: string): string {
-    return (this.callerTurnCommitsByCallId.get(callId) ?? []).map((entry) => entry.text).join(" ");
   }
 
   private clearUserTranscriptState(callId: string, owner: UserTranscriptState): void {
