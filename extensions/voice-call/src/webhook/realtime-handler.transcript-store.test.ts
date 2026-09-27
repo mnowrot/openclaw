@@ -354,6 +354,22 @@ describe("RealtimeCallHandler stored dialogue", () => {
     ]);
   });
 
+  it("keeps a new caller utterance that repeats a stored turn exactly", async () => {
+    const dialogue = await startDialogue();
+    dialogue.callbacks.onTranscript?.("user", "yes", false);
+    dialogue.callbacks.onTranscript?.("assistant", "First reply", true);
+    // The final covers only the "yes" streamed since the stored turn, so it is new speech.
+    dialogue.callbacks.onTranscript?.("user", "yes", false);
+    dialogue.callbacks.onTranscript?.("user", "yes", true);
+    await dialogue.close();
+
+    expect(await dialogue.readStoredTranscript()).toEqual([
+      ["user", "yes"],
+      ["bot", "First reply"],
+      ["user", "yes"],
+    ]);
+  });
+
   it("keeps a new caller turn that extends a stored turn", async () => {
     const dialogue = await startDialogue();
     dialogue.callbacks.onTranscript?.("user", "hello", false);
