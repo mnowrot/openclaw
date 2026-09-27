@@ -62,17 +62,17 @@ const MAX_REALTIME_WS_BUFFERED_BYTES = 1024 * 1024;
 const REALTIME_MEDIA_INACTIVITY_TIMEOUT_MS = 30_000;
 const REALTIME_DISCONNECT_HANGUP_GRACE_MS = 2_000;
 // Assistant audio leaked back through the line can look like caller speech to the local RMS
-// gate. Track the loudest input seen while assistant audio was active (echo) separately from
-// the loudest input seen once the line was quiet (genuine caller speech), and only treat the
-// latter as caller barge-in / a committed transcript.
+// gate. Input heard while our own audio is on the line is echo unless it clearly exceeds the
+// learned leak floor; only caller-attributable input may arm barge-in, and a committed user
+// transcript is dropped only on positive echo evidence (see the phantom guard in onTranscript).
 const ASSISTANT_SPEECH_TAIL_MS = 400;
-const PHANTOM_GUARD_MAX_AGE_MS = 15_000;
 const PHANTOM_GUARD_MIN_RMS = 0.035;
 // Near-end caller speech overlapping our own audio is louder than the echo that leaks back through
 // the line. Track the running echo level and only treat overlap audio that clearly exceeds it as
 // caller speech, so a sustained interruption still barges in while leaked playback does not.
 const ECHO_OVERLAP_MARGIN = 2.5;
 const ECHO_BASELINE_SMOOTHING = 0.3;
+const ECHO_FLOOR_MIN_SAMPLES = 4;
 const FORCED_CONSULT_FALLBACK_DELAY_MS = 200;
 const FORCED_CONSULT_NATIVE_DEDUPE_MS = 2_000;
 const FORCED_CONSULT_RESULT_MAX_CHARS = 1800;
@@ -1007,12 +1007,17 @@ export class RealtimeCallHandler {
     let provisionalCloseReason: RealtimeVoiceCloseReason | undefined;
     let sessionClosed = false;
     let lastAssistantAudioSentAt = 0;
-    let lastLocalAudioAt = 0;
+    // Per-turn input accounting, reset on every committed or suppressed final user transcript.
+    let callerAudioSinceTranscript = false;
     let maxRecentInputRms = 0;
     let maxEchoInputRms = 0;
     let echoBaselineRms = 0;
     let echoBaselineSamples = 0;
+    const isAssistantAudioActive = () =>
+      audioPacer.hasPendingAudio() ||
+      Date.now() - lastAssistantAudioSentAt < ASSISTANT_SPEECH_TAIL_MS;
     const resetInputAccounting = () => {
+      callerAudioSinceTranscript = false;
       maxRecentInputRms = 0;
       maxEchoInputRms = 0;
     };
@@ -1153,9 +1158,10 @@ export class RealtimeCallHandler {
         const turnId = harness.ensureTurn();
         // A final user transcript can be conjured entirely from assistant audio leaking back
         // through the line. Decide before emitting anything: a suppressed phantom must never reach
-        // the Talk observer as committed caller input. The utterance is discarded only when no
-        // caller speech was seen for the whole guard window AND the loudest caller-side input since
-        // the last transcript was weak, so a genuinely loud caller is never dropped.
+        // the Talk observer as committed caller input. Suppression needs positive echo evidence:
+        // our audio is on the line now, the only input heard this turn arrived under it, and none
+        // of that input rose above the learned leak floor or the speech gate. Missing local
+        // evidence (provider-side VAD, no inbound media, a quiet caller) never drops a turn.
         if (role === "user" && isFinal) {
           const state = this.getUserTranscriptState(callId, userTranscriptOwner);
           if (!state) {
@@ -1166,14 +1172,15 @@ export class RealtimeCallHandler {
             rawPartial: state.rawPartial,
             final: text,
           });
-          const localAudioAgeMs = lastLocalAudioAt === 0 ? null : Date.now() - lastLocalAudioAt;
-          const staleLocalAudio =
-            lastLocalAudioAt === 0 ||
-            (localAudioAgeMs !== null && localAudioAgeMs > PHANTOM_GUARD_MAX_AGE_MS);
-          const weakInputAudio = maxRecentInputRms < PHANTOM_GUARD_MIN_RMS;
-          if (staleLocalAudio && weakInputAudio) {
+          // Quiet-line input as loud as the echo, or loud enough for the speech gate, is caller
+          // evidence; with no echo heard this turn (maxEchoInputRms === 0) nothing is suppressed.
+          const phantomEcho =
+            isAssistantAudioActive() &&
+            !callerAudioSinceTranscript &&
+            maxRecentInputRms < Math.min(PHANTOM_GUARD_MIN_RMS, maxEchoInputRms);
+          if (phantomEcho) {
             console.warn(
-              `[voice-call] realtime phantom transcript suppressed callId=${callId} providerCallId=${callSid} chars=${text.trim().length} maxRecentInputRms=${maxRecentInputRms.toFixed(4)} maxEchoInputRms=${maxEchoInputRms.toFixed(4)} lastLocalAudioAgeMs=${localAudioAgeMs === null ? "none" : localAudioAgeMs} staleLocalAudio=${staleLocalAudio} weakInputAudio=${weakInputAudio}`,
+              `[voice-call] realtime phantom transcript suppressed callId=${callId} providerCallId=${callSid} chars=${text.trim().length} maxRecentInputRms=${maxRecentInputRms.toFixed(4)} maxEchoInputRms=${maxEchoInputRms.toFixed(4)} echoFloorRms=${echoBaselineRms.toFixed(4)}`,
             );
             resetInputAccounting();
             this.resetUserTranscriptState(callId, userTranscriptOwner);
@@ -1235,13 +1242,16 @@ export class RealtimeCallHandler {
           void transcriptPersistence.catch(reportTranscriptFailure);
           return;
         }
-        const eventType = isFinal ? "output.text.done" : "output.text.delta";
-        harness.emit({
-          type: eventType,
-          turnId,
-          payload: { text },
-          final: isFinal,
-        });
+        harness.emit(
+          role === "assistant"
+            ? {
+                type: isFinal ? "output.text.done" : "output.text.delta",
+                turnId,
+                payload: { text },
+                final: isFinal,
+              }
+            : { type: "transcript.delta", turnId, payload: { role, text }, final: false },
+        );
         if (!isFinal) {
           if (role === "user" && text.trim()) {
             const transcript = this.recordPartialUserTranscript(callId, userTranscriptOwner, text);
@@ -1453,43 +1463,45 @@ export class RealtimeCallHandler {
         return;
       }
       const inputRms = calculateMulawRms(audio);
-      // Echo accounting: while assistant audio is still draining, any input energy is (at least
-      // partly) our own audio coming back, so it must not count as caller speech. Only energy seen
-      // while the line is quiet can arm the local barge-in gate, and only sustained quiet-line
-      // speech counts.
-      const assistantAudioActive =
-        audioPacer.hasPendingAudio() ||
-        Date.now() - lastAssistantAudioSentAt < ASSISTANT_SPEECH_TAIL_MS;
+      // Echo accounting: while assistant audio is still draining, input energy is (at least
+      // partly) our own audio coming back. Such a frame counts as caller speech only when it
+      // clearly exceeds the learned leak floor; otherwise the speech gate sees silence, so echo
+      // can neither arm local barge-in nor cancel the assistant's own turn.
+      const assistantAudioActive = isAssistantAudioActive();
+      let callerFrame = !assistantAudioActive;
       if (assistantAudioActive) {
         if (inputRms > maxEchoInputRms) {
           maxEchoInputRms = inputRms;
         }
-        // Learn the leaked-playback floor from quiet corrected samples so a caller who talks over
-        // the assistant can be distinguished from the echo. Compare against the floor learned from
-        // the *previous* frames, then fold this frame in, so a loud frame cannot raise the very
-        // threshold it is being judged against. Anything well above the learned floor is genuine
-        // caller energy and must keep the phantom guard from suppressing the turn.
-        const learnedEchoFloor = echoBaselineRms;
-        if (inputRms > 0) {
+        // Judge the frame against the leaked-playback floor learned from earlier frames. Until a
+        // floor is learned (the first frames of the call's first playback), assume echo may reach
+        // the speech gate threshold, so only overlap clearly above that counts as the caller.
+        const echoFloor =
+          echoBaselineSamples < ECHO_FLOOR_MIN_SAMPLES ? PHANTOM_GUARD_MIN_RMS : echoBaselineRms;
+        if (inputRms > echoFloor * ECHO_OVERLAP_MARGIN) {
+          callerFrame = true;
+          callerAudioSinceTranscript = true;
+          if (inputRms > maxRecentInputRms) {
+            maxRecentInputRms = inputRms;
+          }
+        } else if (inputRms > 0) {
+          // Only echo-attributed frames teach the floor: folding caller frames in would lift the
+          // floor to the caller's level and end a sustained interruption before it can barge in.
           echoBaselineSamples += 1;
           echoBaselineRms =
             echoBaselineSamples === 1
               ? inputRms
               : echoBaselineRms + (inputRms - echoBaselineRms) * ECHO_BASELINE_SMOOTHING;
         }
-        if (echoBaselineSamples >= 4 && inputRms > learnedEchoFloor * ECHO_OVERLAP_MARGIN) {
-          if (inputRms > maxRecentInputRms) {
-            maxRecentInputRms = inputRms;
-          }
-          lastLocalAudioAt = Date.now();
-        }
       } else if (inputRms > maxRecentInputRms) {
         maxRecentInputRms = inputRms;
       }
-      const sustainedCallerSpeech =
-        !assistantAudioActive && speechDetector.accept({ rms: inputRms, peak: 0 });
+      const sustainedCallerSpeech = speechDetector.accept({
+        rms: callerFrame ? inputRms : 0,
+        peak: 0,
+      });
       if (sustainedCallerSpeech) {
-        lastLocalAudioAt = Date.now();
+        callerAudioSinceTranscript = true;
         console.log(
           `[voice-call] realtime local speech detected callId=${callId} providerCallId=${callSid}`,
         );
