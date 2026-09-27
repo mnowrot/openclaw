@@ -311,7 +311,9 @@ export default definePluginEntry({
       // ensureRuntime() pass: the latter can spawn a second runtime (and its webhook
       // listener) while the first is still serving the active call.
       const liveSlot = runtimeCoordinator.slot;
-      if (liveSlot && liveSlot.state === "running") return liveSlot.runtime;
+      if (liveSlot && liveSlot.state === "running") {
+        return liveSlot.runtime;
+      }
       return ensureRuntime();
     };
     const commands = createVoiceCallCommandService(ensureRuntimeForCommands);
