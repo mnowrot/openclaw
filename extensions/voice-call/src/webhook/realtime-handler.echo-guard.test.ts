@@ -16,6 +16,9 @@ const ASSISTANT_MULAW = 0x00; // peak output frame (never treated as input)
 const LOUD_ECHO_MULAW = 0x48; // rms ~= 0.0419
 const LOUD_CALLER_MULAW = 0x20; // rms ~= 0.2421
 const QUIET_ECHO_MULAW = 0x58; // rms ~= 0.0189 — weak bleed, softer than a soft caller
+// Bleed from a louder later playback segment: above ECHO_OVERLAP_MARGIN x QUIET_ECHO (~0.047) but
+// below the unlearned-floor overlap threshold (PHANTOM_GUARD_MIN_RMS x margin ~= 0.0875).
+const LOUDER_SEGMENT_ECHO_MULAW = 0x40; // rms ~= 0.0575
 
 function mulawFrame(code: number, bytes = 160): Buffer {
   return Buffer.alloc(bytes, code);
@@ -38,9 +41,10 @@ async function waitForFrames(
 describe("RealtimeCallHandler echo/phantom input guard", () => {
   it("keeps a genuine caller turn that rises clearly above the learned echo floor", async () => {
     let callbacks: RealtimeVoiceBridgeCreateRequest | undefined;
+    const sendAudio = vi.fn();
     const { call, handler, processEvent } = createCarrierLifecycleHarness((request) => {
       callbacks = request;
-      return createBridge(() => {});
+      return createBridge(() => {}, { sendAudio });
     });
     const { server, ws } = await connectCarrierStream(handler);
     try {
@@ -63,10 +67,8 @@ describe("RealtimeCallHandler echo/phantom input guard", () => {
         await sendMedia(ws, mulawFrame(CALLER_MULAW));
         callbacks?.onAudio(mulawFrame(ASSISTANT_MULAW));
       }
-      // Let the carrier frames reach the handler's input accounting before the provider finalises.
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, 80);
-      });
+      // The handler forwards each carrier frame to the bridge only after its input accounting ran.
+      await vi.waitFor(() => expect(sendAudio).toHaveBeenCalledTimes(9));
       callbacks?.onTranscript?.("user", "Yes, book it for Friday.", true);
 
       await waitForFrames(processEvent as ReturnType<typeof vi.fn>, 1);
@@ -83,9 +85,10 @@ describe("RealtimeCallHandler echo/phantom input guard", () => {
 
   it("suppresses a phantom caller turn conjured only from assistant bleed", async () => {
     let callbacks: RealtimeVoiceBridgeCreateRequest | undefined;
+    const sendAudio = vi.fn();
     const { call, handler, processEvent } = createCarrierLifecycleHarness((request) => {
       callbacks = request;
-      return createBridge(() => {});
+      return createBridge(() => {}, { sendAudio });
     });
     const { server, ws } = await connectCarrierStream(handler);
     try {
@@ -103,9 +106,7 @@ describe("RealtimeCallHandler echo/phantom input guard", () => {
         await sendMedia(ws, mulawFrame(ECHO_MULAW));
         callbacks?.onAudio(mulawFrame(ASSISTANT_MULAW));
       }
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, 80);
-      });
+      await vi.waitFor(() => expect(sendAudio).toHaveBeenCalledTimes(6));
       callbacks?.onTranscript?.("user", "Please cancel the whole order.", true);
 
       // Give the handler a beat to decide, then assert nothing was persisted as caller speech.
@@ -186,6 +187,31 @@ describe("RealtimeCallHandler echo/phantom input guard", () => {
       });
       expect(harness.speechTranscripts()).toEqual([]);
     } finally {
+      await harness.close();
+    }
+  });
+
+  it("re-learns the echo floor when a louder playback segment follows a quiet one", async () => {
+    const harness = await startEchoCall("MZ-echo-louder-segment");
+    // Freeze the wall clock so the playback tail is controlled by the test, not by runner speed.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      // A quiet first playback segment teaches a low echo floor.
+      await harness.sendFramesUnderAssistant(QUIET_ECHO_MULAW, 6);
+      harness.callbacks()?.onTranscript?.("user", "Please cancel the whole order.", true);
+      // The line goes quiet past the playback tail, then a louder segment starts. The caller
+      // stays silent: every inbound frame is louder bleed from the new segment.
+      vi.setSystemTime(Date.now() + 1_000);
+      await harness.sendFramesUnderAssistant(LOUDER_SEGMENT_ECHO_MULAW, 12);
+      expect(harness.handleBargeIn).not.toHaveBeenCalled();
+
+      harness.callbacks()?.onTranscript?.("user", "Refund everything now.", true);
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+      expect(harness.speechTranscripts()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
       await harness.close();
     }
   });

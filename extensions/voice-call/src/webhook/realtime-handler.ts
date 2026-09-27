@@ -68,8 +68,10 @@ const REALTIME_DISCONNECT_HANGUP_GRACE_MS = 2_000;
 const ASSISTANT_SPEECH_TAIL_MS = 400;
 const PHANTOM_GUARD_MIN_RMS = 0.035;
 // Near-end caller speech overlapping our own audio is louder than the echo that leaks back through
-// the line. Track the running echo level and only treat overlap audio that clearly exceeds it as
-// caller speech, so a sustained interruption still barges in while leaked playback does not.
+// the line. Track the running echo level of the current playback segment and only treat overlap
+// audio that clearly exceeds it as caller speech, so a sustained interruption still barges in while
+// leaked playback does not. The leak level follows the playback level, so each segment (assistant
+// audio resuming after the line went quiet) re-learns its own floor.
 const ECHO_OVERLAP_MARGIN = 2.5;
 const ECHO_BASELINE_SMOOTHING = 0.3;
 const ECHO_FLOOR_MIN_SAMPLES = 4;
@@ -1011,6 +1013,7 @@ export class RealtimeCallHandler {
     let callerAudioSinceTranscript = false;
     let maxRecentInputRms = 0;
     let maxEchoInputRms = 0;
+    // Echo floor of the current playback segment; reset whenever assistant audio resumes.
     let echoBaselineRms = 0;
     let echoBaselineSamples = 0;
     const isAssistantAudioActive = () =>
@@ -1119,6 +1122,13 @@ export class RealtimeCallHandler {
         isOpen: () => !sessionClosed && ws.readyState === WebSocket.OPEN,
         sendAudio: (muLaw, metadata) => {
           harness.recordOutputAudio(muLaw);
+          if (!isAssistantAudioActive()) {
+            // A new playback segment can be louder or quieter than the last one, and its leak
+            // level with it. A floor learned under quieter playback would read louder echo as the
+            // caller (false barge-in); one learned under louder playback would hide the caller.
+            echoBaselineRms = 0;
+            echoBaselineSamples = 0;
+          }
           audioPacer.sendAudio(muLaw, metadata);
           lastAssistantAudioSentAt = Date.now();
         },
@@ -1473,9 +1483,9 @@ export class RealtimeCallHandler {
         if (inputRms > maxEchoInputRms) {
           maxEchoInputRms = inputRms;
         }
-        // Judge the frame against the leaked-playback floor learned from earlier frames. Until a
-        // floor is learned (the first frames of the call's first playback), assume echo may reach
-        // the speech gate threshold, so only overlap clearly above that counts as the caller.
+        // Judge the frame against the leaked-playback floor learned from earlier frames of this
+        // playback segment. Until a floor is learned (the segment's first frames), assume echo may
+        // reach the speech gate threshold, so only overlap clearly above that counts as the caller.
         const echoFloor =
           echoBaselineSamples < ECHO_FLOOR_MIN_SAMPLES ? PHANTOM_GUARD_MIN_RMS : echoBaselineRms;
         if (inputRms > echoFloor * ECHO_OVERLAP_MARGIN) {
