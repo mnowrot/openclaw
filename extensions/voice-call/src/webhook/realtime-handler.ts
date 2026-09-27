@@ -1276,7 +1276,7 @@ export class RealtimeCallHandler {
           void transcriptPersistence.catch(reportTranscriptFailure);
           return;
         }
-        if (/\?/.test(text)) {
+        if (text.includes("?")) {
           consentWindow.noteAssistantTurn(text);
         }
         transcriptPersistence = this.manager
