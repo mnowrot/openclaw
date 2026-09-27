@@ -253,6 +253,26 @@ describe("RealtimeCallHandler stored dialogue", () => {
     ]);
   });
 
+  it("stores a caller final deferred behind a pending turn write ahead of its reply", async () => {
+    const dialogue = await startDialogue({ transcript: "yes", mode: "hold" });
+    dialogue.callbacks.onTranscript?.("user", "yes", false);
+    dialogue.callbacks.onTranscript?.("assistant", "First reply", true);
+    await dialogue.gateReached;
+    // The "yes" write is still pending, so this final waits for the ledger to settle;
+    // the reply that answers it must not overtake it in the manager queue.
+    dialogue.callbacks.onTranscript?.("user", "okay", true);
+    dialogue.callbacks.onTranscript?.("assistant", "Second reply", true);
+    dialogue.release();
+    expect(await dialogue.close()).toBeUndefined();
+
+    expect(await dialogue.readStoredTranscript()).toEqual([
+      ["user", "yes"],
+      ["bot", "First reply"],
+      ["user", "okay"],
+      ["bot", "Second reply"],
+    ]);
+  });
+
   it("keeps a repeated caller utterance a provider finalizes on its own", async () => {
     const dialogue = await startDialogue();
     dialogue.callbacks.onTranscript?.("user", "I said yes", false);

@@ -994,6 +994,11 @@ export class RealtimeCallHandler {
     // any turn write is still deciding whether it belongs there.
     let callerTurnWrites = Promise.resolve();
     let pendingCallerTurnWrites = 0;
+    // Set while a caller final waits for the ledger to settle; resolves once that final has
+    // been issued to the manager, so writes that follow it cannot take its queue slot.
+    let deferredCallerFinalIssued: Promise<void> | undefined;
+    const issueAfterDeferredCallerFinal = <T>(issue: () => Promise<T>): Promise<T> =>
+      deferredCallerFinalIssued ? deferredCallerFinalIssued.then(issue) : issue();
     // Caller turns this connection has written, so the provider's cumulative flush can be
     // reduced to text no turn write has claimed. The ledger belongs to the bridge, not the
     // call: a replacement connection starts its own, and a provider close cannot clear a
@@ -1260,11 +1265,22 @@ export class RealtimeCallHandler {
           // an already-resolved chain first would push it a microtask later. Only a turn write
           // still in flight is worth waiting for, because the ledger is not settled until it
           // decides whether its text belongs there.
-          trackTranscriptWrite(
-            pendingCallerTurnWrites > 0
-              ? callerTurnWrites.then(flushResidualCallerText)
-              : flushResidualCallerText(),
-          );
+          if (pendingCallerTurnWrites === 0) {
+            trackTranscriptWrite(issueAfterDeferredCallerFinal(flushResidualCallerText));
+            return;
+          }
+          // The final's text cannot be computed before the ledger settles, so its queue slot
+          // cannot be reserved early. Hold what follows instead: callbacks on one promise run
+          // in registration order and the flush issues its write synchronously, so `issued`
+          // resolves only after the final is in the manager queue.
+          const ledgerSettled = callerTurnWrites;
+          trackTranscriptWrite(ledgerSettled.then(flushResidualCallerText));
+          const issued = ledgerSettled.then(() => {
+            if (deferredCallerFinalIssued === issued) {
+              deferredCallerFinalIssued = undefined;
+            }
+          });
+          deferredCallerFinalIssued = issued;
           return;
         }
         const pendingCallerTurn = this.takeCallerTurnCommitText(callId, userTranscriptOwner);
@@ -1273,8 +1289,8 @@ export class RealtimeCallHandler {
           // caller turn ahead of the reply it answered. Awaiting it here instead would both
           // delay the reply and let one rejection swallow the rest of the call.
           const commit = recordCommittedCallerTurn(pendingCallerTurn);
-          const callerTurnWrite = this.manager
-            .processEvent({
+          const callerTurnWrite = issueAfterDeferredCallerFinal(() =>
+            this.manager.processEvent({
               id: `realtime-caller-turn-${callSid}-${randomUUID()}`,
               type: "call.speech",
               callId,
@@ -1282,13 +1298,13 @@ export class RealtimeCallHandler {
               timestamp: Date.now(),
               transcript: pendingCallerTurn.text,
               isFinal: true,
-            })
-            .catch((error: unknown) => {
-              // The turn never landed, so drop it from the ledger and let the provider's
-              // end-of-call flush carry the text rather than losing the turn entirely.
-              releaseCommittedCallerTurn(commit);
-              throw error;
-            });
+            }),
+          ).catch((error: unknown) => {
+            // The turn never landed, so drop it from the ledger and let the provider's
+            // end-of-call flush carry the text rather than losing the turn entirely.
+            releaseCommittedCallerTurn(commit);
+            throw error;
+          });
           pendingCallerTurnWrites += 1;
           const callerTurnSettled = callerTurnWrite
             .catch(() => undefined)
@@ -1303,14 +1319,16 @@ export class RealtimeCallHandler {
         // Independent of the caller turn above: a rejected caller write must not suppress
         // the assistant reply that pairs with it.
         trackTranscriptWrite(
-          this.manager.processEvent({
-            id: `realtime-bot-${callSid}-${randomUUID()}`,
-            type: "call.assistant-speech",
-            callId,
-            providerCallId: callSid,
-            timestamp: Date.now(),
-            transcript: text,
-          }),
+          issueAfterDeferredCallerFinal(() =>
+            this.manager.processEvent({
+              id: `realtime-bot-${callSid}-${randomUUID()}`,
+              type: "call.assistant-speech",
+              callId,
+              providerCallId: callSid,
+              timestamp: Date.now(),
+              transcript: text,
+            }),
+          ),
         );
       },
       onToolCall: async (toolEvent, sessionLocal) => {
