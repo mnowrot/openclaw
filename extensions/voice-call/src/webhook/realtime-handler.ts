@@ -188,14 +188,16 @@ function compactTranscriptText(value: string): string {
  * Reduce an incoming caller final against the caller turns this connection has
  * already written, keeping only text no turn write has claimed.
  *
- * Reduction applies solely to a final that restates committed turns from the
- * start, which is the cumulative-flush contract: Google Live accumulates the
- * caller's input transcript and flushes all of it when the connection closes, so
- * that final repeats every turn already stored. A provider that finalizes each
- * utterance instead restates at most the oldest unclaimed turn, so every final
- * claims only the turns it actually repeats and a caller who says the same short
- * phrase twice keeps both turns. Text that does not restate a committed turn is
- * returned whole (over-keep, never drop).
+ * The final's scope comes from the provider's own stream, not from its text: every
+ * provider finalizes the caller speech it streamed as partials since its previous
+ * final, and the handler records that stream. Turns committed from the stream are
+ * in the ledger; the stream since the last commit is `streamedSinceCommit`. So a
+ * final longer than that stream also restates committed turns (Google Live
+ * accumulates the input transcript and flushes it at close), and exactly the excess
+ * is restated. A final no longer than the stream restates nothing and is one new
+ * utterance, even when its text equals a stored turn ("yes", "yes"). The text only
+ * verifies that accounting: a final that does not restate exactly the oldest
+ * committed turns followed by the stream is returned whole (over-keep, never drop).
  */
 function reduceFinalCallerTranscript(
   committed: readonly CallerTurnCommit[],
@@ -203,9 +205,7 @@ function reduceFinalCallerTranscript(
   streamedSinceCommit: { text: string; omittedPrefixChars: number },
 ): CallerFinalReduction {
   const source = normalizeTranscriptText(incoming);
-  if (!source) {
-    return { residual: "", claimedTurns: 0, recovered: [] };
-  }
+  const whole = { residual: source, claimedTurns: 0, recovered: [] };
   let compact = "";
   const indexByCompact: number[] = [];
   for (let index = 0; index < source.length; index += 1) {
@@ -216,48 +216,34 @@ function reduceFinalCallerTranscript(
     compact += character.toLowerCase();
     indexByCompact.push(index);
   }
-  if (!compact) {
-    return { residual: "", claimedTurns: 0, recovered: [] };
+  const streamedCompact = compactTranscriptText(streamedSinceCommit.text);
+  const restatedLength =
+    compact.length - streamedSinceCommit.omittedPrefixChars - streamedCompact.length;
+  if (restatedLength <= 0 || !compact.endsWith(streamedCompact)) {
+    return whole;
   }
   let matched = 0;
   let claimedTurns = 0;
   const recovered: string[] = [];
   for (const commit of committed) {
-    const commitCompact = compactTranscriptText(commit.text);
+    if (matched === restatedLength) {
+      break;
+    }
     // A bounded turn contains only its tail. Match it at the original offset so
     // the final cannot re-store that turn or claim unrelated text by substring.
     const start = matched + commit.omittedPrefixChars;
-    const end = start + commitCompact.length;
-    // A restated turn ends at a word boundary in the final: the final ends there, or the
-    // source skips whitespace between the last matched character and the next one.
-    // Otherwise the turn only shares a prefix with a longer word ("hi" in "high").
-    const nextIndex = indexByCompact[end];
-    const lastIndex = indexByCompact[end - 1];
-    if (
-      !compact.startsWith(commitCompact, start) ||
-      (nextIndex !== undefined && (lastIndex === undefined || nextIndex - lastIndex < 2))
-    ) {
+    const commitCompact = compactTranscriptText(commit.text);
+    if (!compact.startsWith(commitCompact, start)) {
       break;
     }
-    matched = end;
+    matched = start + commitCompact.length;
     claimedTurns += 1;
     if (commit.unstored) {
       recovered.push(commit.text);
     }
   }
-  // A cumulative flush repeats the committed turns followed by exactly the speech the
-  // provider streamed since the last commit. New text after the claimed turns that the
-  // stream does not account for means the final is one new utterance that merely opens
-  // with a stored turn ("hello" then "hello again"), so it is kept whole.
-  const residualCompact = compact.slice(matched);
-  const streamedCompact = compactTranscriptText(streamedSinceCommit.text);
-  if (
-    claimedTurns === 0 ||
-    (residualCompact &&
-      (residualCompact.length !== streamedSinceCommit.omittedPrefixChars + streamedCompact.length ||
-        !residualCompact.endsWith(streamedCompact)))
-  ) {
-    return { residual: source, claimedTurns: 0, recovered: [] };
+  if (matched !== restatedLength) {
+    return whole;
   }
   const position = indexByCompact[matched];
   return {
