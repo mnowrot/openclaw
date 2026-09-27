@@ -168,7 +168,7 @@ function limitPartialUserTranscript(text: string): string {
 }
 
 /** One caller turn already written to the store, tracked for end-of-call dedupe. */
-type CallerTurnCommit = { text: string };
+type CallerTurnCommit = { text: string; omittedPrefixChars: number };
 
 /** New caller speech in an incoming final, plus how many committed turns it restated. */
 type CallerFinalReduction = { residual: string; claimedTurns: number };
@@ -215,10 +215,13 @@ function reduceFinalCallerTranscript(
   let claimedTurns = 0;
   for (const commit of committed) {
     const commitCompact = compactTranscriptText(commit.text);
-    if (!compact.startsWith(commitCompact, matched)) {
+    // A bounded turn contains only its tail. Match it at the original offset so
+    // the final cannot re-store that turn or claim unrelated text by substring.
+    const start = matched + commit.omittedPrefixChars;
+    if (!compact.startsWith(commitCompact, start)) {
       break;
     }
-    matched += commitCompact.length;
+    matched = start + commitCompact.length;
     claimedTurns += 1;
   }
   if (claimedTurns === 0) {
@@ -322,6 +325,7 @@ type NativeConsultOutcome = { kind: "completed"; result: unknown } | { kind: "ca
 type UserTranscriptState = {
   partial?: string;
   rawPartial?: string;
+  rawPartialOmittedPrefixChars?: number;
   partialUpdatedAt?: number;
   recentFinal?: string;
   recentFinalTimer?: ReturnType<typeof setTimeout>;
@@ -997,8 +1001,7 @@ export class RealtimeCallHandler {
     // overlap-deduplicated, because a caller may repeat the same short phrase ("yes",
     // "yes") and both turns have to remain.
     const committedCallerTurns: CallerTurnCommit[] = [];
-    const recordCommittedCallerTurn = (text: string): CallerTurnCommit => {
-      const commit: CallerTurnCommit = { text };
+    const recordCommittedCallerTurn = (commit: CallerTurnCommit): CallerTurnCommit => {
       committedCallerTurns.push(commit);
       return commit;
     };
@@ -1180,7 +1183,7 @@ export class RealtimeCallHandler {
           });
         }
         if (!isFinal) {
-          if (role === "user" && text.trim()) {
+          if (role === "user" && text) {
             const transcript = this.recordPartialUserTranscript(callId, userTranscriptOwner, text);
             if (!transcript) {
               return;
@@ -1277,7 +1280,7 @@ export class RealtimeCallHandler {
               callId,
               providerCallId: callSid,
               timestamp: Date.now(),
-              transcript: pendingCallerTurn,
+              transcript: pendingCallerTurn.text,
               isFinal: true,
             })
             .catch((error: unknown) => {
@@ -1714,7 +1717,12 @@ export class RealtimeCallHandler {
       return undefined;
     }
     const next = limitPartialUserTranscript(appendTranscriptText(state.partial, text));
-    const raw = limitPartialUserTranscript(`${state.rawPartial ?? ""}${text}`);
+    const rawCombined = `${state.rawPartial ?? ""}${text}`;
+    const raw = limitPartialUserTranscript(rawCombined);
+    state.rawPartialOmittedPrefixChars =
+      (state.rawPartialOmittedPrefixChars ?? 0) +
+      compactTranscriptText(rawCombined).length -
+      compactTranscriptText(raw).length;
     state.partial = next;
     state.rawPartial = raw;
     state.partialUpdatedAt = Date.now();
@@ -1728,6 +1736,7 @@ export class RealtimeCallHandler {
     }
     state.partial = undefined;
     state.rawPartial = undefined;
+    state.rawPartialOmittedPrefixChars = undefined;
     state.partialUpdatedAt = undefined;
   }
 
@@ -1780,16 +1789,22 @@ export class RealtimeCallHandler {
    * ledger (used to reduce a cumulative provider final) records the turn separately,
    * as its write is issued.
    */
-  private takeCallerTurnCommitText(callId: string, owner: UserTranscriptState): string | undefined {
+  private takeCallerTurnCommitText(
+    callId: string,
+    owner: UserTranscriptState,
+  ): CallerTurnCommit | undefined {
     const state = this.getUserTranscriptState(callId, owner);
-    const pending = normalizeTranscriptText(state?.partial ?? "");
+    // Provider deltas carry their own word boundaries; the consult context's
+    // smart join can insert spaces inside words split across frames.
+    const pending = normalizeTranscriptText(state?.rawPartial ?? "");
     if (!pending) {
       return undefined;
     }
+    const commit = { text: pending, omittedPrefixChars: state?.rawPartialOmittedPrefixChars ?? 0 };
     if (state?.partial) {
       this.consumePartialUserTranscript(callId, owner, state.partial);
     }
-    return pending;
+    return commit;
   }
 
   private clearUserTranscriptState(callId: string, owner: UserTranscriptState): void {
@@ -1899,6 +1914,7 @@ export class RealtimeCallHandler {
       if (remaining) {
         state.partial = remaining;
         state.rawPartial = remaining;
+        state.rawPartialOmittedPrefixChars = 0;
       } else {
         this.clearPartialUserTranscript(callId, owner);
       }

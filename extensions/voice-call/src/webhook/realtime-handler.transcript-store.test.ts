@@ -162,6 +162,42 @@ describe("RealtimeCallHandler stored dialogue", () => {
     ]);
   });
 
+  it("does not store a long caller turn again when the final includes its discarded prefix", async () => {
+    const dialogue = await startDialogue();
+    const first = "Caller detail. ".repeat(100);
+    const second = `${"More detail. ".repeat(100)}Final detail.`;
+    dialogue.callbacks.onTranscript?.("user", first, false);
+    dialogue.callbacks.onTranscript?.("user", second, false);
+    dialogue.callbacks.onTranscript?.("assistant", "Details received", true);
+    closeLikeGoogleLive(dialogue.callbacks, `${first}${second} Goodbye.`);
+
+    expect(await dialogue.close()).toBeUndefined();
+    const stored = await dialogue.readStoredTranscript();
+    expect(stored).toEqual([
+      ["user", expect.stringMatching(/Final detail\.$/)],
+      ["bot", "Details received"],
+      ["user", "Goodbye."],
+    ]);
+  });
+
+  it("preserves words split across provider input transcription frames", async () => {
+    const dialogue = await startDialogue();
+    // Google Live forwards inputTranscription text fragments without joining them.
+    dialogue.callbacks.onTranscript?.("user", "What is the", false);
+    dialogue.callbacks.onTranscript?.("user", " ca", false);
+    dialogue.callbacks.onTranscript?.("user", "pital", false);
+    dialogue.callbacks.onTranscript?.("user", " ", false);
+    dialogue.callbacks.onTranscript?.("user", "of France?", false);
+    dialogue.callbacks.onTranscript?.("assistant", "Paris", true);
+    closeLikeGoogleLive(dialogue.callbacks, "What is the capital of France?");
+
+    expect(await dialogue.close()).toBeUndefined();
+    expect(await dialogue.readStoredTranscript()).toEqual([
+      ["user", "What is the capital of France?"],
+      ["bot", "Paris"],
+    ]);
+  });
+
   it("finishes a queued caller turn write before shutdown completes", async () => {
     const dialogue = await startDialogue({ transcript: "yes", mode: "hold" });
     speakDialogue(dialogue.callbacks);
