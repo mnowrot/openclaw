@@ -133,6 +133,19 @@ describe("RealtimeCallHandler stored dialogue", () => {
     callbacks.onTranscript?.("user", "yes okay goodbye", true);
   }
 
+  /**
+   * Google Live accumulates the caller's input transcript, flushes all of it when the
+   * connection ends, and only then notifies close - so a caller turn write still in
+   * flight has to survive the close callback for the flush to reduce against it.
+   */
+  function closeLikeGoogleLive(
+    callbacks: RealtimeVoiceBridgeCreateRequest,
+    flushedTranscript: string,
+  ): void {
+    callbacks.onTranscript?.("user", flushedTranscript, true);
+    callbacks.onClose?.("completed");
+  }
+
   it("stores each caller turn ahead of the reply it answered", async () => {
     const dialogue = await startDialogue();
     speakDialogue(dialogue.callbacks);
@@ -182,6 +195,61 @@ describe("RealtimeCallHandler stored dialogue", () => {
       ["bot", "Second reply"],
       // ...and the flush carries the lost turn instead of dropping it.
       ["user", "okay goodbye"],
+    ]);
+  });
+
+  it("reduces the Google Live flush against a caller write still pending at close", async () => {
+    const dialogue = await startDialogue({ transcript: "yes", mode: "hold" });
+    dialogue.callbacks.onTranscript?.("user", "yes", false);
+    dialogue.callbacks.onTranscript?.("assistant", "First reply", true);
+    dialogue.callbacks.onTranscript?.("user", "goodbye", false);
+    await dialogue.gateReached;
+
+    closeLikeGoogleLive(dialogue.callbacks, "yes goodbye");
+    dialogue.release();
+    await dialogue.close();
+
+    expect(await dialogue.readStoredTranscript()).toEqual([
+      ["user", "yes"],
+      ["bot", "First reply"],
+      // The flush lands after close, so its reduction still has to see the pending turn.
+      ["user", "goodbye"],
+    ]);
+  });
+
+  it("keeps a repeated caller utterance a provider finalizes on its own", async () => {
+    const dialogue = await startDialogue();
+    dialogue.callbacks.onTranscript?.("user", "I said yes", false);
+    dialogue.callbacks.onTranscript?.("assistant", "First reply", true);
+    // A provider that finalizes each utterance restates only that utterance, so this
+    // final is new speech even though the committed turn already contains the phrase.
+    dialogue.callbacks.onTranscript?.("user", "yes", false);
+    dialogue.callbacks.onTranscript?.("user", "yes", true);
+    await dialogue.close();
+
+    expect(await dialogue.readStoredTranscript()).toEqual([
+      ["user", "I said yes"],
+      ["bot", "First reply"],
+      ["user", "yes"],
+    ]);
+  });
+
+  it("stores repeated per-utterance finals once when each restates a committed turn", async () => {
+    const dialogue = await startDialogue();
+    dialogue.callbacks.onTranscript?.("user", "I said yes", false);
+    dialogue.callbacks.onTranscript?.("assistant", "First reply", true);
+    dialogue.callbacks.onTranscript?.("user", "yes", false);
+    dialogue.callbacks.onTranscript?.("assistant", "Second reply", true);
+    // Both finals arrive late, each restating one committed turn.
+    dialogue.callbacks.onTranscript?.("user", "I said yes", true);
+    dialogue.callbacks.onTranscript?.("user", "yes", true);
+    await dialogue.close();
+
+    expect(await dialogue.readStoredTranscript()).toEqual([
+      ["user", "I said yes"],
+      ["bot", "First reply"],
+      ["user", "yes"],
+      ["bot", "Second reply"],
     ]);
   });
 });
