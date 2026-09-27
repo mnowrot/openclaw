@@ -270,8 +270,9 @@ describe("RealtimeCallHandler transcript disposal", () => {
       callbacks?.onTranscript?.("assistant", "Second reply", true);
       await vi.waitFor(() => {
         const assistantTurns = processEvent.mock.calls
-          .filter(([event]) => event.type === "call.assistant-speech")
-          .map(([event]) => event.transcript);
+          .map(([event]) => event)
+          .filter((event) => event.type === "call.assistant-speech")
+          .map((event) => event.transcript);
         expect(assistantTurns).toEqual(["First reply", "Second reply"]);
       });
     } finally {
@@ -308,8 +309,9 @@ describe("RealtimeCallHandler transcript disposal", () => {
       });
       expect(
         processEvent.mock.calls
-          .filter(([event]) => event.type === "call.speech")
-          .map(([event]) => event.transcript),
+          .map(([event]) => event)
+          .filter((event) => event.type === "call.speech")
+          .map((event) => event.transcript),
       ).toEqual(["hello", "hello"]);
     } finally {
       ws.terminate();
