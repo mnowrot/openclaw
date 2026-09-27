@@ -226,10 +226,19 @@ function reduceFinalCallerTranscript(
     // A bounded turn contains only its tail. Match it at the original offset so
     // the final cannot re-store that turn or claim unrelated text by substring.
     const start = matched + commit.omittedPrefixChars;
-    if (!compact.startsWith(commitCompact, start)) {
+    const end = start + commitCompact.length;
+    // A restated turn ends at a word boundary in the final: the final ends there, or the
+    // source skips whitespace between the last matched character and the next one.
+    // Otherwise the turn only shares a prefix with a longer word ("hi" in "high").
+    const nextIndex = indexByCompact[end];
+    const lastIndex = indexByCompact[end - 1];
+    if (
+      !compact.startsWith(commitCompact, start) ||
+      (nextIndex !== undefined && (lastIndex === undefined || nextIndex - lastIndex < 2))
+    ) {
       break;
     }
-    matched = start + commitCompact.length;
+    matched = end;
     claimedTurns += 1;
     if (commit.unstored) {
       recovered.push(commit.text);

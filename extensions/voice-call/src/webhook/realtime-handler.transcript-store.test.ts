@@ -334,4 +334,20 @@ describe("RealtimeCallHandler stored dialogue", () => {
       ["bot", "Second reply"],
     ]);
   });
+
+  it("keeps a new caller turn whose text starts with a stored turn", async () => {
+    const dialogue = await startDialogue();
+    dialogue.callbacks.onTranscript?.("user", "hi", false);
+    dialogue.callbacks.onTranscript?.("assistant", "First reply", true);
+    // "high" opens with the letters of the stored "hi" but does not restate that turn.
+    dialogue.callbacks.onTranscript?.("user", "high", false);
+    dialogue.callbacks.onTranscript?.("user", "high", true);
+    await dialogue.close();
+
+    expect(await dialogue.readStoredTranscript()).toEqual([
+      ["user", "hi"],
+      ["bot", "First reply"],
+      ["user", "high"],
+    ]);
+  });
 });
