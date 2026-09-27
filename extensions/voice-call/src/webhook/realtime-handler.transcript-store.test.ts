@@ -130,6 +130,8 @@ describe("RealtimeCallHandler stored dialogue", () => {
     callbacks.onTranscript?.("assistant", "First reply", true);
     callbacks.onTranscript?.("user", "okay", false);
     callbacks.onTranscript?.("assistant", "Second reply", true);
+    // Google Live streams each input fragment before its end-of-call flush.
+    callbacks.onTranscript?.("user", "goodbye", false);
     callbacks.onTranscript?.("user", "yes okay goodbye", true);
   }
 
@@ -169,6 +171,7 @@ describe("RealtimeCallHandler stored dialogue", () => {
     dialogue.callbacks.onTranscript?.("user", first, false);
     dialogue.callbacks.onTranscript?.("user", second, false);
     dialogue.callbacks.onTranscript?.("assistant", "Details received", true);
+    dialogue.callbacks.onTranscript?.("user", "Goodbye.", false);
     closeLikeGoogleLive(dialogue.callbacks, `${first}${second} Goodbye.`);
 
     expect(await dialogue.close()).toBeUndefined();
@@ -348,6 +351,22 @@ describe("RealtimeCallHandler stored dialogue", () => {
       ["user", "hi"],
       ["bot", "First reply"],
       ["user", "high"],
+    ]);
+  });
+
+  it("keeps a new caller turn that extends a stored turn", async () => {
+    const dialogue = await startDialogue();
+    dialogue.callbacks.onTranscript?.("user", "hello", false);
+    dialogue.callbacks.onTranscript?.("assistant", "First reply", true);
+    // A per-utterance final that opens with a stored turn is still one new utterance.
+    dialogue.callbacks.onTranscript?.("user", "hello again", false);
+    dialogue.callbacks.onTranscript?.("user", "hello again", true);
+    await dialogue.close();
+
+    expect(await dialogue.readStoredTranscript()).toEqual([
+      ["user", "hello"],
+      ["bot", "First reply"],
+      ["user", "hello again"],
     ]);
   });
 });

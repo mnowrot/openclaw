@@ -200,6 +200,7 @@ function compactTranscriptText(value: string): string {
 function reduceFinalCallerTranscript(
   committed: readonly CallerTurnCommit[],
   incoming: string,
+  streamedSinceCommit: { text: string; omittedPrefixChars: number },
 ): CallerFinalReduction {
   const source = normalizeTranscriptText(incoming);
   if (!source) {
@@ -244,8 +245,19 @@ function reduceFinalCallerTranscript(
       recovered.push(commit.text);
     }
   }
-  if (claimedTurns === 0) {
-    return { residual: source, claimedTurns: 0, recovered };
+  // A cumulative flush repeats the committed turns followed by exactly the speech the
+  // provider streamed since the last commit. New text after the claimed turns that the
+  // stream does not account for means the final is one new utterance that merely opens
+  // with a stored turn ("hello" then "hello again"), so it is kept whole.
+  const residualCompact = compact.slice(matched);
+  const streamedCompact = compactTranscriptText(streamedSinceCommit.text);
+  if (
+    claimedTurns === 0 ||
+    (residualCompact &&
+      (residualCompact.length !== streamedSinceCommit.omittedPrefixChars + streamedCompact.length ||
+        !residualCompact.endsWith(streamedCompact)))
+  ) {
+    return { residual: source, claimedTurns: 0, recovered: [] };
   }
   const position = indexByCompact[matched];
   return {
@@ -1225,6 +1237,10 @@ export class RealtimeCallHandler {
             rawPartial: state.rawPartial,
             final: text,
           });
+          const streamedSinceCommit = {
+            text: state.rawPartial ?? "",
+            omittedPrefixChars: state.rawPartialOmittedPrefixChars ?? 0,
+          };
           this.clearPartialUserTranscript(callId, userTranscriptOwner);
           const generation = continuityGeneration;
           // A provider that restates the call in this final has to be reduced to the
@@ -1232,7 +1248,11 @@ export class RealtimeCallHandler {
           // moment they are issued and mark it unstored only if they fail, so the ledger
           // is authoritative as soon as none are in flight.
           const flushResidualCallerText = async () => {
-            const reduction = reduceFinalCallerTranscript(committedCallerTurns, transcript);
+            const reduction = reduceFinalCallerTranscript(
+              committedCallerTurns,
+              transcript,
+              streamedSinceCommit,
+            );
             // Claim only the turns this final restated: a later utterance repeating an
             // earlier phrase must still be stored as new speech.
             committedCallerTurns.splice(0, reduction.claimedTurns);
