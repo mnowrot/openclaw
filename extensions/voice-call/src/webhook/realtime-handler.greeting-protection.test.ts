@@ -146,6 +146,60 @@ describe("RealtimeCallHandler greeting protection", () => {
   );
 
   it(
+    "releases caller audio without completing a cancelled greeting",
+    async () => {
+      let callbacks: RealtimeVoiceBridgeCreateRequest | undefined;
+      const providerAudio: Buffer[] = [];
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      const { call, handler } = createCarrierLifecycleHarness(
+        (request) => {
+          callbacks = request;
+          return createBridge(() => undefined, {
+            sendAudio: (audio: Buffer) => {
+              providerAudio.push(Buffer.from(audio));
+            },
+          });
+        },
+        { initialMessage: "Hello, is this a good time?" },
+      );
+      const { server, ws } = await connectCarrierStream(handler);
+      const outboundFrames = observeCarrierFrames(ws);
+      try {
+        ws.send(
+          JSON.stringify({
+            event: "start",
+            start: { streamSid: "MZ-greet-cancelled", callSid: call.providerCallId },
+          }),
+        );
+        await vi.waitFor(() => expect(callbacks).toBeDefined());
+        vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+        callbacks?.onReady?.();
+        callbacks?.onAudio?.(Buffer.alloc(160 * 8, 0xff), { itemId: "greeting-partial" });
+
+        callbacks?.onResponseDone?.({
+          status: "cancelled",
+          responseId: "greeting",
+          reason: "caller interruption",
+        });
+
+        expect(log).toHaveBeenCalledWith(
+          expect.stringContaining("realtime response cancelled: caller interruption"),
+        );
+        vi.advanceTimersByTime(1_000);
+        expect(findGreetingCompletionMark(outboundFrames)).toBeUndefined();
+        await expectCallerAudio(ws, providerAudio, "audio");
+      } finally {
+        vi.useRealTimers();
+        log.mockRestore();
+        ws.terminate();
+        await handler.close().catch(() => undefined);
+        await server.close();
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
     "keeps protection until the carrier confirms the greeting played, then resumes caller audio",
     async () => {
       let callbacks: RealtimeVoiceBridgeCreateRequest | undefined;
@@ -272,14 +326,16 @@ describe("RealtimeCallHandler greeting protection", () => {
   );
 
   it(
-    "keeps late greeting audio protected after releasing caller audio during the pre-audio wait",
+    "keeps caller audio muted until a late greeting is carrier-confirmed",
     async () => {
       let callbacks: RealtimeVoiceBridgeCreateRequest | undefined;
       const providerAudio: Buffer[] = [];
+      const handleBargeIn = vi.fn();
       const { call, handler } = createCarrierLifecycleHarness(
         (request) => {
           callbacks = request;
           return createBridge(() => undefined, {
+            handleBargeIn,
             sendAudio: (audio: Buffer) => {
               providerAudio.push(Buffer.from(audio));
             },
@@ -302,18 +358,26 @@ describe("RealtimeCallHandler greeting protection", () => {
         await expectCallerAudio(ws, providerAudio, "silence");
 
         vi.advanceTimersByTime(3_100);
-        await expectCallerAudio(ws, providerAudio, "audio");
-
-        callbacks?.onAudio?.(Buffer.alloc(160 * 16, 0xff), { itemId: "greeting-late" });
         const clearCount = outboundFrames.filter((frame) => frame.event === "clear").length;
-        callbacks?.onClearAudio("barge-in");
         providerAudio.length = 0;
         for (let index = 0; index < 4; index += 1) {
           sendCallerAudio(ws);
         }
         await vi.waitFor(() => expect(providerAudio).toHaveLength(4));
         expect(providerAudio.every(isSilence)).toBe(true);
+        expect(handleBargeIn).not.toHaveBeenCalled();
         expect(outboundFrames.filter((frame) => frame.event === "clear")).toHaveLength(clearCount);
+
+        callbacks?.onAudio?.(Buffer.alloc(160 * 16, 0xff), { itemId: "greeting-late" });
+        callbacks?.onResponseDone?.({ status: "completed", responseId: "greeting" });
+        vi.advanceTimersByTime(1_000);
+        await vi.waitFor(() => expect(findGreetingCompletionMark(outboundFrames)).toBeDefined());
+        await expectCallerAudio(ws, providerAudio, "silence");
+
+        const greetingCompletionMark = findGreetingCompletionMark(outboundFrames);
+        expect(greetingCompletionMark).toBeDefined();
+        ws.send(JSON.stringify({ event: "mark", mark: { name: greetingCompletionMark } }));
+        await expectCallerAudio(ws, providerAudio, "audio");
       } finally {
         vi.useRealTimers();
         ws.terminate();
