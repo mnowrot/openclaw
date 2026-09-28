@@ -64,7 +64,8 @@ const REALTIME_DISCONNECT_HANGUP_GRACE_MS = 2_000;
 // Assistant audio leaked back through the line can look like caller speech to the local RMS
 // gate. Input heard while our own audio is on the line is echo unless it clearly exceeds the
 // learned leak floor; only caller-attributable input may arm barge-in, and a committed user
-// transcript is dropped only on positive echo evidence (see the phantom guard in onTranscript).
+// transcript is dropped only on unambiguous echo evidence (see the phantom guard in onTranscript).
+// The tail runs from the end of paced playout, not from when the provider handed us the audio.
 const ASSISTANT_SPEECH_TAIL_MS = 400;
 const PHANTOM_GUARD_MIN_RMS = 0.035;
 // Near-end caller speech overlapping our own audio is louder than the echo that leaks back through
@@ -73,6 +74,10 @@ const PHANTOM_GUARD_MIN_RMS = 0.035;
 // leaked playback does not. The leak level follows the playback level, so each segment (assistant
 // audio resuming after the line went quiet) re-learns its own floor.
 const ECHO_OVERLAP_MARGIN = 2.5;
+// Overlap input above the learned floor by this much is too weak to barge in, but it may be the
+// caller talking softly over playback. Amplitude alone cannot tell, so the turn is ambiguous and
+// the provider's committed transcript is kept.
+const ECHO_AMBIGUITY_MARGIN = 1.25;
 const ECHO_BASELINE_SMOOTHING = 0.3;
 const ECHO_FLOOR_MIN_SAMPLES = 4;
 const FORCED_CONSULT_FALLBACK_DELAY_MS = 200;
@@ -1008,7 +1013,6 @@ export class RealtimeCallHandler {
     const nativeConsultOwner: { current?: ActiveRealtimeVoiceBridge } = {};
     let provisionalCloseReason: RealtimeVoiceCloseReason | undefined;
     let sessionClosed = false;
-    let lastAssistantAudioSentAt = 0;
     // Per-turn input accounting, reset on every committed or suppressed final user transcript.
     let callerAudioSinceTranscript = false;
     let maxRecentInputRms = 0;
@@ -1018,7 +1022,7 @@ export class RealtimeCallHandler {
     let echoBaselineSamples = 0;
     const isAssistantAudioActive = () =>
       audioPacer.hasPendingAudio() ||
-      Date.now() - lastAssistantAudioSentAt < ASSISTANT_SPEECH_TAIL_MS;
+      Date.now() < audioPacer.getPlayoutEndsAt() + ASSISTANT_SPEECH_TAIL_MS;
     const resetInputAccounting = () => {
       callerAudioSinceTranscript = false;
       maxRecentInputRms = 0;
@@ -1130,7 +1134,6 @@ export class RealtimeCallHandler {
             echoBaselineSamples = 0;
           }
           audioPacer.sendAudio(muLaw, metadata);
-          lastAssistantAudioSentAt = Date.now();
         },
         // Telephony pacing knows what actually reached the line; the provider's
         // inbound media clock can run far ahead of playout.
@@ -1168,10 +1171,11 @@ export class RealtimeCallHandler {
         const turnId = harness.ensureTurn();
         // A final user transcript can be conjured entirely from assistant audio leaking back
         // through the line. Decide before emitting anything: a suppressed phantom must never reach
-        // the Talk observer as committed caller input. Suppression needs positive echo evidence:
+        // the Talk observer as committed caller input. Suppression needs unambiguous echo evidence:
         // our audio is on the line now, the only input heard this turn arrived under it, and none
-        // of that input rose above the learned leak floor or the speech gate. Missing local
-        // evidence (provider-side VAD, no inbound media, a quiet caller) never drops a turn.
+        // of that input rose above the learned leak floor (by ECHO_AMBIGUITY_MARGIN) or the speech
+        // gate. Missing or mixed local evidence (provider-side VAD, no inbound media, a quiet
+        // caller, a soft caller over playback) never drops a turn.
         if (role === "user" && isFinal) {
           const state = this.getUserTranscriptState(callId, userTranscriptOwner);
           if (!state) {
@@ -1495,6 +1499,13 @@ export class RealtimeCallHandler {
             maxRecentInputRms = inputRms;
           }
         } else if (inputRms > 0) {
+          if (
+            echoBaselineSamples >= ECHO_FLOOR_MIN_SAMPLES &&
+            inputRms > echoBaselineRms * ECHO_AMBIGUITY_MARGIN
+          ) {
+            // Possibly a soft caller over playback: not enough to barge in, enough to keep the turn.
+            callerAudioSinceTranscript = true;
+          }
           // Only echo-attributed frames teach the floor: folding caller frames in would lift the
           // floor to the caller's level and end a sustained interruption before it can barge in.
           echoBaselineSamples += 1;

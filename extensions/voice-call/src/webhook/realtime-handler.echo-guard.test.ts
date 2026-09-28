@@ -147,6 +147,14 @@ describe("RealtimeCallHandler echo/phantom input guard", () => {
       }
       await vi.waitFor(() => expect(sendAudio).toHaveBeenCalledTimes(expected));
     };
+    // Carrier frames with no new assistant audio submitted alongside them.
+    const sendInboundFrames = async (code: number, count: number) => {
+      const expected = sendAudio.mock.calls.length + count;
+      for (let index = 0; index < count; index += 1) {
+        await sendMedia(ws, mulawFrame(code));
+      }
+      await vi.waitFor(() => expect(sendAudio).toHaveBeenCalledTimes(expected));
+    };
     // Frames sent before any assistant audio reached the line.
     const sendQuietLineFrames = async (code: number, count: number) => {
       const expected = sendAudio.mock.calls.length + count;
@@ -165,11 +173,13 @@ describe("RealtimeCallHandler echo/phantom input guard", () => {
       await server.close();
     };
     return {
+      bridgeSendAudio: sendAudio,
       callbacks: () => callbacks,
       close,
       handleBargeIn,
       processEvent: processEvent as ReturnType<typeof vi.fn>,
       sendFramesUnderAssistant,
+      sendInboundFrames,
       sendQuietLineFrames,
       speechTranscripts,
     };
@@ -253,6 +263,44 @@ describe("RealtimeCallHandler echo/phantom input guard", () => {
       harness.callbacks()?.onAudio(mulawFrame(ASSISTANT_MULAW));
       harness.callbacks()?.onTranscript?.("user", "Yes, that works.", true);
       await vi.waitFor(() => expect(harness.speechTranscripts()).toEqual(["Yes, that works."]));
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("treats echo as echo until a chunk longer than the tail has played out", async () => {
+    const harness = await startEchoCall("MZ-echo-long-chunk");
+    // Drive the pacer's telephony clock and the wall clock together.
+    vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
+    try {
+      // One provider chunk holding 4 s of audio, far longer than the playback tail.
+      harness.callbacks()?.onAudio(mulawFrame(ASSISTANT_MULAW, 8 * 4_000));
+      // The pacer has handed every frame to the carrier; the last 160 ms are still playing.
+      vi.advanceTimersByTime(3_900);
+      // The caller stays silent: the inbound frames are loud echo of that playout.
+      await harness.sendInboundFrames(LOUD_ECHO_MULAW, 12);
+      expect(harness.handleBargeIn).not.toHaveBeenCalled();
+
+      harness.callbacks()?.onTranscript?.("user", "Please cancel the whole order.", true);
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+      expect(harness.speechTranscripts()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+      await harness.close();
+    }
+  });
+
+  it("keeps a caller turn spoken over playback below the barge-in margin", async () => {
+    const harness = await startEchoCall("MZ-echo-moderate-overlap");
+    try {
+      // Playback teaches a quiet echo floor.
+      await harness.sendFramesUnderAssistant(QUIET_ECHO_MULAW, 6);
+      // The caller answers over playback at ~1.4x the floor: too soft to barge in, but not echo.
+      await harness.sendFramesUnderAssistant(ECHO_MULAW, 6);
+      harness.callbacks()?.onTranscript?.("user", "Friday works.", true);
+      await vi.waitFor(() => expect(harness.speechTranscripts()).toEqual(["Friday works."]));
     } finally {
       await harness.close();
     }
