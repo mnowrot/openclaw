@@ -1318,6 +1318,7 @@ export class RealtimeCallHandler {
       onEvent: (event) => {
         if (event.direction === "client" && event.type === "session.continuity.reset") {
           continuityGeneration += 1;
+          disarmGreetingWindow("continuity-reset");
           // A fresh provider session cannot complete the prior session's text,
           // audio, tool work, or Talk turn.
           const turnId = harness.talk.activeTurnId;
