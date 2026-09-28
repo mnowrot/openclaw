@@ -934,10 +934,10 @@ export class RealtimeCallHandler {
     // disarms once the carrier confirms greeting playout. The hard timeout is only an outermost
     // safety net for a carrier or provider that never produces a terminal signal.
     const GREETING_PROTECTION_MAX_MS = 30_000;
-    // Bound the pre-audio wait separately: the window arms at provider readiness, before any
-    // greeting audio arrives. If the provider stalls or produces no audio, caller input must not be
-    // replaced by silence for the whole window - release it as soon as the greeting fails to start.
-    const GREETING_PROTECTION_AUDIO_WAIT_MS = 3_000;
+    // The window arms at provider readiness, before any greeting audio arrives. During that
+    // pre-audio wait caller audio is still withheld from the provider (silence is sent) so a delayed
+    // greeting cannot be barged in before its first chunk. A response that ends without audio, or is
+    // cancelled, releases the caller immediately; the hard timeout is the only stall backstop.
     const GREETING_PROTECTION_QUIET_MS = 900;
     const GREETING_PROTECTION_POLL_MS = 100;
     // After the greeting audio is fully queued we ask the carrier to confirm playout with a mark.
@@ -948,7 +948,6 @@ export class RealtimeCallHandler {
       disarmed: boolean;
       audioStarted: boolean;
       turnComplete: boolean;
-      muteCallerAudio: boolean;
       callerAudioMuteLogged: boolean;
       completionMarkName?: string;
       timer?: ReturnType<typeof setInterval>;
@@ -957,7 +956,6 @@ export class RealtimeCallHandler {
       disarmed: false,
       audioStarted: false,
       turnComplete: false,
-      muteCallerAudio: false,
       callerAudioMuteLogged: false,
       completionMarkName: undefined,
       timer: undefined,
@@ -969,7 +967,6 @@ export class RealtimeCallHandler {
       }
       greetingWindow.armed = false;
       greetingWindow.disarmed = true;
-      greetingWindow.muteCallerAudio = false;
       if (greetingWindow.timer) {
         clearInterval(greetingWindow.timer);
         greetingWindow.timer = undefined;
@@ -1006,7 +1003,6 @@ export class RealtimeCallHandler {
       greetingWindow.disarmed = false;
       greetingWindow.audioStarted = false;
       greetingWindow.turnComplete = false;
-      greetingWindow.muteCallerAudio = true;
       greetingWindow.callerAudioMuteLogged = false;
       greetingWindow.completionMarkName = undefined;
       const startedAt = Date.now();
@@ -1016,13 +1012,7 @@ export class RealtimeCallHandler {
           disarmGreetingWindow("timeout");
           return;
         }
-        if (!greetingWindow.audioStarted) {
-          if (elapsedMs >= GREETING_PROTECTION_AUDIO_WAIT_MS) {
-            greetingWindow.muteCallerAudio = false;
-          }
-          return;
-        }
-        if (!greetingWindow.turnComplete) {
+        if (!greetingWindow.audioStarted || !greetingWindow.turnComplete) {
           return;
         }
         if (
@@ -1140,7 +1130,6 @@ export class RealtimeCallHandler {
           lastAssistantAudioSentAt = Date.now();
           if (greetingProtected()) {
             greetingWindow.audioStarted = true;
-            greetingWindow.muteCallerAudio = true;
           }
         },
         // Telephony pacing knows what actually reached the line; the provider's
@@ -1370,6 +1359,15 @@ export class RealtimeCallHandler {
           disarmGreetingWindow(`response-${outcome.status}`);
           return;
         }
+        // A cancelled greeting was cut off, so its partial output must not be treated as a
+        // completed opening; end protection without arming a completion mark behind it.
+        if (outcome.status === "cancelled") {
+          console.log(
+            `[voice-call] realtime response cancelled${outcome.reason ? `: ${outcome.reason}` : ""}`,
+          );
+          disarmGreetingWindow("response-cancelled");
+          return;
+        }
         if (!greetingProtected()) {
           return;
         }
@@ -1513,10 +1511,9 @@ export class RealtimeCallHandler {
       // While greeting audio is protected the caller's audio is not forwarded to the realtime
       // provider - mu-law silence (0xFF) is sent instead so the input stream keeps its cadence. The
       // provider otherwise takes a user turn from the callee's barge-in while the opening is still
-      // playing and answers that speech as if it were the reply to the question. A stalled
-      // pre-audio window remains armed for a late greeting burst but releases caller audio until
-      // that burst begins.
-      if (greetingProtected() && greetingWindow.muteCallerAudio) {
+      // playing and answers that speech as if it were the reply to the question. This includes the
+      // pre-audio wait, so a delayed greeting cannot be interrupted before its first chunk.
+      if (greetingProtected()) {
         if (!greetingWindow.callerAudioMuteLogged) {
           greetingWindow.callerAudioMuteLogged = true;
           console.log(
