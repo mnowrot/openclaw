@@ -961,12 +961,14 @@ export class RealtimeCallHandler {
       timer: undefined,
     };
     let greetingCompletionMarkSequence = 0;
+    let greetingLocalSpeechSuppressionLogged = false;
     const disarmGreetingWindow = (reason: string): void => {
       if (!greetingWindow.armed) {
         return;
       }
       greetingWindow.armed = false;
       greetingWindow.disarmed = true;
+      greetingLocalSpeechSuppressionLogged = false;
       if (greetingWindow.timer) {
         clearInterval(greetingWindow.timer);
         greetingWindow.timer = undefined;
@@ -1005,6 +1007,7 @@ export class RealtimeCallHandler {
       greetingWindow.turnComplete = false;
       greetingWindow.callerAudioMuteLogged = false;
       greetingWindow.completionMarkName = undefined;
+      greetingLocalSpeechSuppressionLogged = false;
       const startedAt = Date.now();
       greetingWindow.timer = setInterval(() => {
         const elapsedMs = Date.now() - startedAt;
@@ -1488,9 +1491,12 @@ export class RealtimeCallHandler {
             // re-triggers the local barge-in immediately instead of waiting for a fresh quiet gap.
             onTrigger: () => {
               if (greetingProtected()) {
-                console.log(
-                  `[voice-call] realtime local speech suppressed during greeting protection callId=${callId} providerCallId=${callSid}`,
-                );
+                if (!greetingLocalSpeechSuppressionLogged) {
+                  greetingLocalSpeechSuppressionLogged = true;
+                  console.log(
+                    `[voice-call] realtime local speech suppressed during greeting protection callId=${callId} providerCallId=${callSid}`,
+                  );
+                }
                 return false;
               }
               return true;
