@@ -81,6 +81,10 @@ const BARGE_IN_REQUIRED_LOUD_CHUNKS = 2;
 const CONSENT_WINDOW_POLL_MS = 250;
 // Hard ceiling on how long the line may stay open waiting for the goodbye to finish playing.
 const CONSENT_WINDOW_MAX_CLOSE_WAIT_MS = 20_000;
+// Upper bound on waiting for the carrier to confirm the consent question finished playing. The
+// answer window only starts once the carrier has played the question; if no mark comes back we still
+// arm, so a silent carrier cannot disable the watchdog entirely.
+const CONSENT_QUESTION_PLAYBACK_WAIT_MS = 5_000;
 const logger = createSubsystemLogger("voice-call/realtime");
 
 function buildGreetingInstructions(
@@ -952,6 +956,10 @@ export class RealtimeCallHandler {
     // gap in the audio -- is what tells us the sentence finished, so a mid-sentence pause cannot be
     // mistaken for the end of the goodbye.
     let lastAssistantFinalTurnAt = 0;
+    // False until the carrier confirms the consent question finished playing; the answer window
+    // must not start while the carrier still buffers the question.
+    let consentQuestionMarkConfirmed = false;
+    let consentQuestionMarkRequested = false;
     const ASSISTANT_SPEECH_TAIL_MS = 400;
     const consentWindowMs = this.config.consentWindow.windowMs;
     // Config explicitly admits this flow and adds the opening question to the provider
@@ -1038,7 +1046,8 @@ export class RealtimeCallHandler {
       pollMs: CONSENT_WINDOW_POLL_MS,
       isBotSpeaking: () =>
         audioPacer.hasPendingAudio() ||
-        Date.now() - lastAssistantAudioSentAt < ASSISTANT_SPEECH_TAIL_MS,
+        Date.now() - lastAssistantAudioSentAt < ASSISTANT_SPEECH_TAIL_MS ||
+        !consentQuestionMarkConfirmed,
       isCallActive: () => !sessionClosed && this.activeBridgesByCallId.get(callId) === session,
       onExpired: () => {
         console.log(
@@ -1067,6 +1076,23 @@ export class RealtimeCallHandler {
         );
       },
     });
+    // Start the answer window only after the carrier confirms it played the consent question. The
+    // mark is queued after the question's audio; if the carrier never acknowledges it we still
+    // confirm after a bounded wait, so a silent carrier cannot disable the watchdog.
+    const requestConsentQuestionPlaybackConfirmation = (): void => {
+      if (consentQuestionMarkRequested) {
+        return;
+      }
+      consentQuestionMarkRequested = true;
+      const markName = `consent-question-${randomUUID()}`;
+      const confirm = (): void => {
+        consentQuestionMarkConfirmed = true;
+      };
+      pendingMarkAcks.set(markName, confirm);
+      audioPacer.sendMark(markName);
+      const fallback = setTimeout(confirm, CONSENT_QUESTION_PLAYBACK_WAIT_MS);
+      fallback.unref?.();
+    };
     // Provisional ownership accepts callbacks fired during createBridge. Commit
     // retires the predecessor only after creation succeeds; failure restores it.
     const userTranscriptAdoption = this.beginUserTranscriptOwnerAdoption(callId);
@@ -1293,14 +1319,15 @@ export class RealtimeCallHandler {
           void transcriptPersistence.catch(reportTranscriptFailure);
           return;
         }
-        // Arm only on the finalized consent turn: a provider may stream the question text and then
-        // pause before finishing the utterance, and arming on the partial would let the watchdog
-        // expire while the assistant is still speaking.
-        if (isFinal && isConsentQuestionUtterance(text)) {
-          consentWindow.noteAssistantTurn();
-        }
         if (isFinal) {
           lastAssistantFinalTurnAt = Date.now();
+          // Arm only on the finalized consent turn: a provider may stream the question text and
+          // then pause before finishing the utterance, and the answer window must wait until the
+          // carrier has played the question rather than merely drained the local queue.
+          if (isConsentQuestionUtterance(text)) {
+            requestConsentQuestionPlaybackConfirmation();
+            consentWindow.noteAssistantTurn();
+          }
         }
         transcriptPersistence = this.manager
           .processEvent({

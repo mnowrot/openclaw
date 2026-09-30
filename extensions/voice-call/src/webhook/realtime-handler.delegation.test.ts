@@ -48,7 +48,7 @@ describe("Voice Call provider-owned delegation", () => {
       request?.onTranscript?.("assistant", "Do you consent to this call being recorded?", true);
       // No goodbye audio is emitted by the stubbed bridge, so the close waits out the
       // bounded 20s ceiling before ending the call.
-      vi.advanceTimersByTime(21_000);
+      vi.advanceTimersByTime(26_000);
       await Promise.resolve();
 
       expect(sendUserMessage).toHaveBeenCalledExactlyOnceWith(
