@@ -1083,7 +1083,9 @@ export class RealtimeCallHandler {
     });
     // Start the answer window only after the carrier confirms it played the consent question. The
     // mark is queued after the question's audio; if the carrier never acknowledges it we still
-    // confirm after a bounded wait, so a silent carrier cannot disable the watchdog.
+    // confirm after a bounded wait, so a silent carrier cannot disable the watchdog. A late
+    // acknowledgment restarts the deadline so the caller's full window is measured from confirmed
+    // playback, not from the earlier bounded no-ack fallback.
     const requestConsentQuestionPlaybackConfirmation = (): void => {
       if (consentQuestionMarkRequested) {
         return;
@@ -1091,8 +1093,12 @@ export class RealtimeCallHandler {
       consentQuestionMarkRequested = true;
       const markName = `consent-question-${randomUUID()}`;
       const acknowledge = (): void => {
+        const wasUnconfirmed = !consentQuestionPlaybackAcked;
         consentQuestionPlaybackAcked = true;
         consentQuestionMarkResolved = true;
+        if (wasUnconfirmed) {
+          consentWindow.notePlaybackConfirmed();
+        }
       };
       pendingMarkAcks.set(markName, acknowledge);
       audioPacer.sendMark(markName);

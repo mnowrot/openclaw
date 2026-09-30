@@ -52,6 +52,18 @@ export class RealtimeConsentWindow {
     this.arm();
   }
 
+  /**
+   * The carrier confirmed the consent question actually played. Restart the answer deadline so the
+   * caller's full configured window is measured from confirmed playback rather than from the
+   * earlier bounded no-ack fallback that may have resolved the mark first.
+   */
+  notePlaybackConfirmed(): void {
+    if (!this.options.enabled || this.fired || this.callerResponded || !this.armed) {
+      return;
+    }
+    this.arm();
+  }
+
   /** The caller said something; the consent gate is satisfied and the watchdog must never fire. */
   noteCallerResponded(): void {
     const firstResponse = !this.callerResponded;
