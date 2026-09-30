@@ -17,6 +17,12 @@ export type RealtimeConsentWindowOptions = {
   enabled: boolean;
   /** How long the caller is given to answer once the bot has stopped speaking. */
   windowMs: number;
+  /**
+   * Extra time added to the answer window when carrier playback was never confirmed. The window
+   * must not pretend an unconfirmed question reached the caller: the bounded no-ack escape path
+   * still runs, but it starts from a conservative point rather than the normal full window.
+   */
+  windowMsExtension?: () => number;
   /** How often to re-check while the bot is still speaking. */
   pollMs: number;
   /** True while the agent's own audio is still draining, so the countdown has not started. */
@@ -68,6 +74,10 @@ export class RealtimeConsentWindow {
     }
   }
 
+  private effectiveWindowMs(): number {
+    return this.options.windowMs + (this.options.windowMsExtension?.() ?? 0);
+  }
+
   private arm(): void {
     if (this.callerResponded || this.fired) {
       return;
@@ -83,7 +93,7 @@ export class RealtimeConsentWindow {
         this.timer.unref?.();
         return;
       }
-      this.timer = setTimeout(() => this.fire(), this.options.windowMs);
+      this.timer = setTimeout(() => this.fire(), this.effectiveWindowMs());
       this.timer.unref?.();
     };
     this.timer = setTimeout(countdown, this.options.pollMs);

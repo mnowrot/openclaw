@@ -1657,7 +1657,7 @@ describe("RealtimeCallHandler path routing", () => {
 
       vi.useFakeTimers();
       callbacks?.onTranscript?.("assistant", "Do you consent to this call being recorded?", true);
-      vi.advanceTimersByTime(26_000);
+      vi.advanceTimersByTime(31_000);
       await Promise.resolve();
 
       expect(sendUserMessage).toHaveBeenCalledExactlyOnceWith(
@@ -1709,7 +1709,7 @@ describe("RealtimeCallHandler path routing", () => {
 
       vi.useFakeTimers();
       callbacks?.onTranscript?.("assistant", "Do you consent to this call being recorded?", true);
-      vi.advanceTimersByTime(26_000);
+      vi.advanceTimersByTime(31_000);
       await Promise.resolve();
 
       expect(endCall).toHaveBeenCalledExactlyOnceWith("call-1", { reason: "timeout" });
@@ -1861,7 +1861,7 @@ describe("RealtimeCallHandler path routing", () => {
 
       // The finalized turn arms it, and the silent caller is then closed.
       callbacks?.onTranscript?.("assistant", "Do you consent to this call being recorded?", true);
-      vi.advanceTimersByTime(26_000);
+      vi.advanceTimersByTime(31_000);
       await Promise.resolve();
       expect(sendUserMessage).toHaveBeenCalledOnce();
       expect(endCall).toHaveBeenCalledExactlyOnceWith("call-1", { reason: "timeout" });

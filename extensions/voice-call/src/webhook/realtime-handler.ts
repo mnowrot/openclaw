@@ -956,9 +956,12 @@ export class RealtimeCallHandler {
     // gap in the audio -- is what tells us the sentence finished, so a mid-sentence pause cannot be
     // mistaken for the end of the goodbye.
     let lastAssistantFinalTurnAt = 0;
-    // False until the carrier confirms the consent question finished playing; the answer window
-    // must not start while the carrier still buffers the question.
-    let consentQuestionMarkConfirmed = false;
+    // Playback confirmation for the consent question. `acked` is set only by a carrier mark;
+    // `resolved` is set by that ack or, failing it, by a bounded fallback so the watchdog can still
+    // escape. The full answer window applies only after the carrier confirmed playback; the
+    // unconfirmed path gets an extra bounded grace instead of being treated as playback-confirmed.
+    let consentQuestionPlaybackAcked = false;
+    let consentQuestionMarkResolved = false;
     let consentQuestionMarkRequested = false;
     const ASSISTANT_SPEECH_TAIL_MS = 400;
     const consentWindowMs = this.config.consentWindow.windowMs;
@@ -1043,11 +1046,12 @@ export class RealtimeCallHandler {
     const consentWindow = new RealtimeConsentWindow({
       enabled: this.config.consentWindow.enabled,
       windowMs: consentWindowMs,
+      windowMsExtension: () => (consentQuestionPlaybackAcked ? 0 : CONSENT_QUESTION_PLAYBACK_WAIT_MS),
       pollMs: CONSENT_WINDOW_POLL_MS,
       isBotSpeaking: () =>
         audioPacer.hasPendingAudio() ||
         Date.now() - lastAssistantAudioSentAt < ASSISTANT_SPEECH_TAIL_MS ||
-        !consentQuestionMarkConfirmed,
+        !consentQuestionMarkResolved,
       isCallActive: () => !sessionClosed && this.activeBridgesByCallId.get(callId) === session,
       onExpired: () => {
         console.log(
@@ -1085,12 +1089,20 @@ export class RealtimeCallHandler {
       }
       consentQuestionMarkRequested = true;
       const markName = `consent-question-${randomUUID()}`;
-      const confirm = (): void => {
-        consentQuestionMarkConfirmed = true;
+      const acknowledge = (): void => {
+        consentQuestionPlaybackAcked = true;
+        consentQuestionMarkResolved = true;
       };
-      pendingMarkAcks.set(markName, confirm);
+      pendingMarkAcks.set(markName, acknowledge);
       audioPacer.sendMark(markName);
-      const fallback = setTimeout(confirm, CONSENT_QUESTION_PLAYBACK_WAIT_MS);
+      const fallback = setTimeout(() => {
+        if (!consentQuestionMarkResolved) {
+          console.warn(
+            `[voice-call] carrier never confirmed consent-question playback callId=${callId} - using the bounded no-ack escape path`,
+          );
+        }
+        consentQuestionMarkResolved = true;
+      }, CONSENT_QUESTION_PLAYBACK_WAIT_MS);
       fallback.unref?.();
     };
     // Provisional ownership accepts callbacks fired during createBridge. Commit
