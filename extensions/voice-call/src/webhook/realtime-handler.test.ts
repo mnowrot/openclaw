@@ -1773,6 +1773,53 @@ describe("RealtimeCallHandler path routing", () => {
     }
   });
 
+  it("does not arm the consent watchdog for a consent statement that asks nothing", async () => {
+    let callbacks: RealtimeBridgeRequest | undefined;
+    const sendUserMessage = vi.fn();
+    const createBridge = vi.fn((request: RealtimeBridgeRequest) => {
+      callbacks = request;
+      return makeBridge({ sendUserMessage });
+    });
+    const call = makeCallRecord("CA-consent-statement");
+    const endCall = vi.fn(async () => ({ success: true }));
+    const handler = makeHandler(
+      { consentWindow: { enabled: true, windowMs: 100 } },
+      {
+        manager: {
+          endCall,
+          getCallByProviderCallId: vi.fn(() => call),
+        },
+        realtimeProvider: makeRealtimeProvider(createBridge),
+      },
+    );
+    const server = await startRealtimeServer(handler);
+    const ws = await connectWs(server.url);
+
+    try {
+      ws.send(
+        JSON.stringify({
+          event: "start",
+          start: { streamSid: "MZ-consent-statement", callSid: call.providerCallId },
+        }),
+      );
+      await waitForRealtimeTest(() => expect(createBridge).toHaveBeenCalledOnce());
+
+      vi.useFakeTimers();
+      // Names both topics but is a policy statement, not a question; it must not arm the timer.
+      callbacks?.onTranscript?.("assistant", "We require consent for recording.", true);
+      vi.advanceTimersByTime(30_000);
+      await Promise.resolve();
+
+      expect(sendUserMessage).not.toHaveBeenCalled();
+      expect(endCall).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      ws.terminate();
+      await handler.close();
+      await server.close();
+    }
+  });
+
   it("ignores an end-call callback from a retired predecessor bridge", async () => {
     const callbacks: RealtimeBridgeRequest[] = [];
     const predecessorClose = vi.fn();

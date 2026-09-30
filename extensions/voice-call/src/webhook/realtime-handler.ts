@@ -963,24 +963,40 @@ export class RealtimeCallHandler {
         );
       }
     };
-    // Hold the line until the goodbye has been spoken and has finished playing, but never
-    // longer than the cap: a stalled provider or queued carrier audio must not keep a silent
-    // caller connected indefinitely.
+    // Hold the line until the goodbye has been spoken and the carrier has confirmed it reached
+    // the line, but never longer than the cap: a stalled provider must not keep a silent caller
+    // connected indefinitely. A drained local send queue is not proof the caller heard the goodbye
+    // (the carrier can still buffer sent audio), so we place a mark after the goodbye and wait for
+    // the carrier's acknowledgement of it before forcing the hangup.
     const endConsentCallDirectly = (): void => {
       const promptedAt = Date.now();
+      let goodbyeMarkName: string | undefined;
+      let goodbyeMarkAcknowledged = false;
       const attemptClose = (): void => {
         if (sessionClosed || this.activeBridgesByCallId.get(callId) !== session) {
           return;
         }
         const elapsedMs = Date.now() - promptedAt;
         const goodbyeStarted = lastAssistantAudioSentAt > promptedAt;
-        const stillPlaying =
-          audioPacer.hasPendingAudio() ||
-          Date.now() - lastAssistantAudioSentAt < ASSISTANT_SPEECH_TAIL_MS;
-        if (elapsedMs < CONSENT_WINDOW_MAX_CLOSE_WAIT_MS && (!goodbyeStarted || stillPlaying)) {
-          const wait = setTimeout(attemptClose, CONSENT_WINDOW_POLL_MS);
-          wait.unref?.();
-          return;
+        const queueDrained =
+          !audioPacer.hasPendingAudio() &&
+          Date.now() - lastAssistantAudioSentAt >= ASSISTANT_SPEECH_TAIL_MS;
+        if (elapsedMs < CONSENT_WINDOW_MAX_CLOSE_WAIT_MS) {
+          const readyToClose = goodbyeStarted && queueDrained && goodbyeMarkAcknowledged;
+          if (!readyToClose) {
+            // The goodbye has stopped locally but the carrier has not yet confirmed playout;
+            // place one mark at the tail and wait for its acknowledgement.
+            if (goodbyeStarted && queueDrained && !goodbyeMarkName) {
+              goodbyeMarkName = `consent-goodbye-${randomUUID()}`;
+              pendingMarkAcks.set(goodbyeMarkName, () => {
+                goodbyeMarkAcknowledged = true;
+              });
+              audioPacer.sendMark(goodbyeMarkName);
+            }
+            const wait = setTimeout(attemptClose, CONSENT_WINDOW_POLL_MS);
+            wait.unref?.();
+            return;
+          }
         }
         const attempt = this.manager
           .endCall(callId, { reason: "timeout" })
