@@ -1293,7 +1293,10 @@ export class RealtimeCallHandler {
           void transcriptPersistence.catch(reportTranscriptFailure);
           return;
         }
-        if (isConsentQuestionUtterance(text)) {
+        // Arm only on the finalized consent turn: a provider may stream the question text and then
+        // pause before finishing the utterance, and arming on the partial would let the watchdog
+        // expire while the assistant is still speaking.
+        if (isFinal && isConsentQuestionUtterance(text)) {
           consentWindow.noteAssistantTurn();
         }
         if (isFinal) {

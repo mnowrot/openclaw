@@ -1820,6 +1820,59 @@ describe("RealtimeCallHandler path routing", () => {
     }
   });
 
+  it("arms the consent watchdog only on the finalized consent question", async () => {
+    let callbacks: RealtimeBridgeRequest | undefined;
+    const sendUserMessage = vi.fn();
+    const createBridge = vi.fn((request: RealtimeBridgeRequest) => {
+      callbacks = request;
+      return makeBridge({ sendUserMessage });
+    });
+    const call = makeCallRecord("CA-consent-final-turn");
+    const endCall = vi.fn(async () => ({ success: true }));
+    const handler = makeHandler(
+      { consentWindow: { enabled: true, windowMs: 100 } },
+      {
+        manager: {
+          endCall,
+          getCallByProviderCallId: vi.fn(() => call),
+        },
+        realtimeProvider: makeRealtimeProvider(createBridge),
+      },
+    );
+    const server = await startRealtimeServer(handler);
+    const ws = await connectWs(server.url);
+
+    try {
+      ws.send(
+        JSON.stringify({
+          event: "start",
+          start: { streamSid: "MZ-consent-final-turn", callSid: call.providerCallId },
+        }),
+      );
+      await waitForRealtimeTest(() => expect(createBridge).toHaveBeenCalledOnce());
+
+      vi.useFakeTimers();
+      // A partial consent question must not arm the timer: the provider may pause mid-utterance.
+      callbacks?.onTranscript?.("assistant", "Do you consent to this call being recorded?", false);
+      vi.advanceTimersByTime(30_000);
+      await Promise.resolve();
+      expect(sendUserMessage).not.toHaveBeenCalled();
+      expect(endCall).not.toHaveBeenCalled();
+
+      // The finalized turn arms it, and the silent caller is then closed.
+      callbacks?.onTranscript?.("assistant", "Do you consent to this call being recorded?", true);
+      vi.advanceTimersByTime(21_000);
+      await Promise.resolve();
+      expect(sendUserMessage).toHaveBeenCalledOnce();
+      expect(endCall).toHaveBeenCalledExactlyOnceWith("call-1", { reason: "timeout" });
+    } finally {
+      vi.useRealTimers();
+      ws.terminate();
+      await handler.close();
+      await server.close();
+    }
+  });
+
   it("ignores an end-call callback from a retired predecessor bridge", async () => {
     const callbacks: RealtimeBridgeRequest[] = [];
     const predecessorClose = vi.fn();
