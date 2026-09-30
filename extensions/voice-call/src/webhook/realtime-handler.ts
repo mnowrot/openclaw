@@ -40,6 +40,7 @@ import { rejectWebSocketUpgrade } from "openclaw/plugin-sdk/websocket-runtime";
 import { resolveVoiceCallPublicPathPrefix, type VoiceCallRealtimeConfig } from "../config.js";
 import type { CallManager } from "../manager.js";
 import { REALTIME_VOICE_END_CALL_TOOL_NAME } from "../realtime-call-control.js";
+import { isConsentQuestionUtterance } from "../realtime-consent.js";
 import type { CallRecord, EndReason, NormalizedEvent } from "../types.js";
 import type { WebhookResponsePayload } from "../webhook.types.js";
 import { WebSocket, WebSocketServer } from "../websocket.js";
@@ -78,7 +79,8 @@ const MAX_PARTIAL_USER_TRANSCRIPT_CHARS = 1_200;
 const RECENT_FINAL_USER_TRANSCRIPT_TTL_MS = 2_000;
 const BARGE_IN_REQUIRED_LOUD_CHUNKS = 2;
 const CONSENT_WINDOW_POLL_MS = 250;
-const CONSENT_WINDOW_END_GRACE_MS = 6_000;
+// Hard ceiling on how long the line may stay open waiting for the goodbye to finish playing.
+const CONSENT_WINDOW_MAX_CLOSE_WAIT_MS = 20_000;
 const logger = createSubsystemLogger("voice-call/realtime");
 
 function buildGreetingInstructions(
@@ -950,9 +952,34 @@ export class RealtimeCallHandler {
     const consentWindowMs = this.config.consentWindow.windowMs;
     // Config explicitly admits this flow and adds the opening question to the provider
     // instructions. Transcript punctuation is not an activation signal.
+    const tellCallerToHangUp = (): void => {
+      try {
+        session.sendUserMessage(
+          "The line could not be closed automatically. Apologise briefly and tell the caller they can hang up now.",
+        );
+      } catch (error) {
+        console.warn(
+          `[voice-call] realtime consent hangup notice failed callId=${callId}: ${formatErrorMessage(error)}`,
+        );
+      }
+    };
+    // Hold the line until the goodbye has been spoken and has finished playing, but never
+    // longer than the cap: a stalled provider or queued carrier audio must not keep a silent
+    // caller connected indefinitely.
     const endConsentCallDirectly = (): void => {
-      const grace = setTimeout(() => {
+      const promptedAt = Date.now();
+      const attemptClose = (): void => {
         if (sessionClosed || this.activeBridgesByCallId.get(callId) !== session) {
+          return;
+        }
+        const elapsedMs = Date.now() - promptedAt;
+        const goodbyeStarted = lastAssistantAudioSentAt > promptedAt;
+        const stillPlaying =
+          audioPacer.hasPendingAudio() ||
+          Date.now() - lastAssistantAudioSentAt < ASSISTANT_SPEECH_TAIL_MS;
+        if (elapsedMs < CONSENT_WINDOW_MAX_CLOSE_WAIT_MS && (!goodbyeStarted || stillPlaying)) {
+          const wait = setTimeout(attemptClose, CONSENT_WINDOW_POLL_MS);
+          wait.unref?.();
           return;
         }
         const attempt = this.manager
@@ -960,8 +987,9 @@ export class RealtimeCallHandler {
           .then((result) => {
             if (!result.success) {
               console.warn(
-                `[voice-call] Failed to end realtime consent call callId=${callId} providerCallId=${callSid} reason=timeout: ${result.error ?? "unknown error"}; call remains active`,
+                `[voice-call] Failed to end realtime consent call callId=${callId} providerCallId=${callSid} reason=timeout: ${result.error ?? "unknown error"}; asking the agent to hand the caller off`,
               );
+              tellCallerToHangUp();
               return;
             }
             console.log(
@@ -970,11 +998,13 @@ export class RealtimeCallHandler {
           })
           .catch((error: unknown) => {
             console.warn(
-              `[voice-call] Failed to end realtime consent call callId=${callId} providerCallId=${callSid} reason=timeout: ${formatErrorMessage(error)}; call remains active`,
+              `[voice-call] Failed to end realtime consent call callId=${callId} providerCallId=${callSid} reason=timeout: ${formatErrorMessage(error)}; asking the agent to hand the caller off`,
             );
+            tellCallerToHangUp();
           });
         this.trackShutdownWork(attempt, this.terminationAttempts);
-      }, CONSENT_WINDOW_END_GRACE_MS);
+      };
+      const grace = setTimeout(attemptClose, CONSENT_WINDOW_POLL_MS);
       grace.unref?.();
     };
     const consentWindow = new RealtimeConsentWindow({
@@ -1238,7 +1268,9 @@ export class RealtimeCallHandler {
           void transcriptPersistence.catch(reportTranscriptFailure);
           return;
         }
-        consentWindow.noteAssistantTurn();
+        if (isConsentQuestionUtterance(text)) {
+          consentWindow.noteAssistantTurn();
+        }
         transcriptPersistence = this.manager
           .processEvent({
             id: `realtime-bot-${callSid}-${randomUUID()}`,

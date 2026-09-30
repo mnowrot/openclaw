@@ -1657,7 +1657,7 @@ describe("RealtimeCallHandler path routing", () => {
 
       vi.useFakeTimers();
       callbacks?.onTranscript?.("assistant", "Do you consent to this call being recorded?", true);
-      vi.advanceTimersByTime(7_000);
+      vi.advanceTimersByTime(21_000);
       await Promise.resolve();
 
       expect(sendUserMessage).toHaveBeenCalledExactlyOnceWith(
@@ -1677,9 +1677,10 @@ describe("RealtimeCallHandler path routing", () => {
 
   it("reports a rejected carrier hangup after the consent window expires", async () => {
     let callbacks: RealtimeBridgeRequest | undefined;
+    const sendUserMessage = vi.fn();
     const createBridge = vi.fn((request: RealtimeBridgeRequest) => {
       callbacks = request;
-      return makeBridge({ sendUserMessage: vi.fn() });
+      return makeBridge({ sendUserMessage });
     });
     const call = makeCallRecord("CA-consent-end-failed");
     const endCall = vi.fn(async () => ({ success: false, error: "carrier rejected hangup" }));
@@ -1708,17 +1709,66 @@ describe("RealtimeCallHandler path routing", () => {
 
       vi.useFakeTimers();
       callbacks?.onTranscript?.("assistant", "Do you consent to this call being recorded?", true);
-      vi.advanceTimersByTime(7_000);
+      vi.advanceTimersByTime(21_000);
       await Promise.resolve();
 
       expect(endCall).toHaveBeenCalledExactlyOnceWith("call-1", { reason: "timeout" });
       expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining("carrier rejected hangup; call remains active"),
+        expect.stringContaining("carrier rejected hangup"),
+      );
+      expect(sendUserMessage).toHaveBeenCalledWith(
+        expect.stringContaining("could not be closed automatically"),
       );
       expect(ws.readyState).toBe(WebSocket.OPEN);
     } finally {
       vi.useRealTimers();
       warn.mockRestore();
+      ws.terminate();
+      await handler.close();
+      await server.close();
+    }
+  });
+
+  it("does not arm the consent watchdog when the first assistant turn is not the consent question", async () => {
+    let callbacks: RealtimeBridgeRequest | undefined;
+    const sendUserMessage = vi.fn();
+    const createBridge = vi.fn((request: RealtimeBridgeRequest) => {
+      callbacks = request;
+      return makeBridge({ sendUserMessage });
+    });
+    const call = makeCallRecord("CA-consent-not-question");
+    const endCall = vi.fn(async () => ({ success: true }));
+    const handler = makeHandler(
+      { consentWindow: { enabled: true, windowMs: 100 } },
+      {
+        manager: {
+          endCall,
+          getCallByProviderCallId: vi.fn(() => call),
+        },
+        realtimeProvider: makeRealtimeProvider(createBridge),
+      },
+    );
+    const server = await startRealtimeServer(handler);
+    const ws = await connectWs(server.url);
+
+    try {
+      ws.send(
+        JSON.stringify({
+          event: "start",
+          start: { streamSid: "MZ-consent-not-question", callSid: call.providerCallId },
+        }),
+      );
+      await waitForRealtimeTest(() => expect(createBridge).toHaveBeenCalledOnce());
+
+      vi.useFakeTimers();
+      callbacks?.onTranscript?.("assistant", "Hello, how can I help you today?", true);
+      vi.advanceTimersByTime(30_000);
+      await Promise.resolve();
+
+      expect(sendUserMessage).not.toHaveBeenCalled();
+      expect(endCall).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
       ws.terminate();
       await handler.close();
       await server.close();
