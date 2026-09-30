@@ -59,6 +59,31 @@ function createAgentRuntime(workspaceDir: string): OpenClawPluginApi["runtime"][
 }
 
 describe("buildRealtimeVoiceInstructions", () => {
+  it("adds the opening question only for the explicit consent flow", async () => {
+    const workspaceDir = await createWorkspace();
+    const coreConfig = { agents: { list: [{ id: "voice" }] } } as OpenClawConfig;
+    const agentRuntime = createAgentRuntime(workspaceDir);
+    const withoutConsent = await buildRealtimeVoiceInstructions({
+      baseInstructions: "Base voice instructions.",
+      config: createConfig(),
+      coreConfig,
+      agentRuntime,
+      agentId: "voice",
+    });
+    const withConsent = await buildRealtimeVoiceInstructions({
+      baseInstructions: "Base voice instructions.",
+      config: createConfig({ consentWindow: { enabled: true, windowMs: 5000 } }),
+      coreConfig,
+      agentRuntime,
+      agentId: "voice",
+    });
+
+    expect(withoutConsent).not.toContain("Do you consent to this call being recorded?");
+    expect(withConsent).toContain(
+      'Your first spoken response must ask exactly, "Do you consent to this call being recorded?"',
+    );
+  });
+
   it("injects bounded identity and workspace context", async () => {
     const workspaceDir = await createWorkspace();
     await writeFile(path.join(workspaceDir, "SOUL.md"), "Stay quick, direct, and warm.\n");

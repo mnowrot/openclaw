@@ -3,17 +3,18 @@
  *
  * The model is instructed to give the caller a few seconds to answer the opening consent
  * question and then apologise and hang up on silence, but nothing in the bridge ever *wakes* the
- * model on silence — it just sits on an open line. This arms a single timer the first time the
- * agent asks a question and, if the caller never speaks, tells the caller-facing code the window
- * expired so it can prompt the goodbye and end the call.
+ * model on silence — it just sits on an open line. When the explicit consent flow is enabled, this
+ * arms a single timer after the first completed assistant turn and, if the caller never speaks,
+ * tells the caller-facing code the window expired so it can prompt the goodbye and end the call.
  *
- * Deliberately narrow: the watchdog only ever arms for the *first* assistant question seen before
- * any caller response, so an ordinary later question can never silently end a live call. Once the
- * caller has spoken, the watchdog is disarmed permanently. A response that arrives after the
- * window fired is still recorded so the caller-facing code can tell "never answered" apart from
- * "answered late".
+ * Deliberately narrow: config, rather than transcript punctuation, admits the flow. With the
+ * default-off opt-in disabled, assistant turns never arm it. Once the caller has spoken, the
+ * watchdog is disarmed permanently. A response that arrives after the window fired is still
+ * recorded so the caller-facing code can tell "never answered" apart from "answered late".
  */
 export type RealtimeConsentWindowOptions = {
+  /** Whether this call is running the explicit opening-consent flow. */
+  enabled: boolean;
   /** How long the caller is given to answer once the bot has stopped speaking. */
   windowMs: number;
   /** How often to re-check while the bot is still speaking. */
@@ -36,12 +37,9 @@ export class RealtimeConsentWindow {
 
   constructor(private readonly options: RealtimeConsentWindowOptions) {}
 
-  /** Feed each final assistant line; only the first question before any caller response arms it. */
-  noteAssistantTurn(text: string): void {
-    if (this.fired || this.callerResponded || this.armed) {
-      return;
-    }
-    if (!text.includes("?")) {
+  /** Record the completed opening turn; only the explicit consent flow can arm the timer. */
+  noteAssistantTurn(): void {
+    if (!this.options.enabled || this.fired || this.callerResponded || this.armed) {
       return;
     }
     this.armed = true;

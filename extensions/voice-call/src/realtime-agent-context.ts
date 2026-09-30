@@ -5,6 +5,7 @@ import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runti
 import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import type { OpenClawPluginApi } from "../api.js";
 import type { VoiceCallConfig } from "./config.js";
+import { REALTIME_VOICE_CONSENT_QUESTION } from "./realtime-consent.js";
 
 // Builds compact agent context injected into realtime voice sessions.
 
@@ -67,6 +68,11 @@ export async function buildRealtimeVoiceInstructions(params: {
   const consultGuidance = buildRealtimeVoiceAgentConsultPolicyInstructions(config.realtime);
   if (consultGuidance) {
     sections.push(consultGuidance);
+  }
+  if (config.realtime.consentWindow.enabled) {
+    sections.push(
+      `Opening consent flow: Your first spoken response must ask exactly, "${REALTIME_VOICE_CONSENT_QUESTION}" Wait for the caller's answer before continuing the conversation.`,
+    );
   }
 
   const contextConfig = config.realtime.agentContext;

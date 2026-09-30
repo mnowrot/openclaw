@@ -9,6 +9,7 @@ function makeWindow(
   let botSpeaking = false;
   let callActive = true;
   const window = new RealtimeConsentWindow({
+    enabled: true,
     windowMs: 100,
     pollMs: 10,
     isBotSpeaking: () => botSpeaking,
@@ -40,26 +41,33 @@ describe("RealtimeConsentWindow", () => {
 
   it("fires once when the caller stays silent after the consent question", () => {
     const { window, onExpired } = makeWindow();
-    window.noteAssistantTurn("Do you consent to this call being recorded?");
+    window.noteAssistantTurn();
     vi.advanceTimersByTime(500);
     expect(onExpired).toHaveBeenCalledTimes(1);
   });
 
-  it("only arms for the first question before any caller response", () => {
-    const { window, onExpired } = makeWindow();
-    window.noteAssistantTurn("Do you consent to this call being recorded?");
+  it("does not arm when the explicit consent flow is disabled", () => {
+    const { window, onExpired } = makeWindow({ enabled: false });
+    window.noteAssistantTurn();
     vi.advanceTimersByTime(500);
-    window.noteAssistantTurn("Would you like me to repeat that?");
+    expect(onExpired).not.toHaveBeenCalled();
+  });
+
+  it("only arms for the first assistant turn before any caller response", () => {
+    const { window, onExpired } = makeWindow();
+    window.noteAssistantTurn();
+    vi.advanceTimersByTime(500);
+    window.noteAssistantTurn();
     vi.advanceTimersByTime(500);
     expect(onExpired).toHaveBeenCalledTimes(1);
   });
 
   it("never fires after the caller has spoken", () => {
     const { window, onExpired } = makeWindow();
-    window.noteAssistantTurn("Do you consent to this call being recorded?");
+    window.noteAssistantTurn();
     window.noteCallerResponded();
     vi.advanceTimersByTime(500);
-    window.noteAssistantTurn("Anything else?");
+    window.noteAssistantTurn();
     vi.advanceTimersByTime(500);
     expect(onExpired).not.toHaveBeenCalled();
   });
@@ -67,7 +75,7 @@ describe("RealtimeConsentWindow", () => {
   it("holds the countdown while the agent is still speaking", () => {
     const { window, onExpired, setBotSpeaking } = makeWindow();
     setBotSpeaking(true);
-    window.noteAssistantTurn("Do you consent to this call being recorded?");
+    window.noteAssistantTurn();
     vi.advanceTimersByTime(500);
     expect(onExpired).not.toHaveBeenCalled();
     setBotSpeaking(false);
@@ -77,7 +85,7 @@ describe("RealtimeConsentWindow", () => {
 
   it("does not fire when the bridge no longer owns the call", () => {
     const { window, onExpired, setCallActive } = makeWindow();
-    window.noteAssistantTurn("Do you consent to this call being recorded?");
+    window.noteAssistantTurn();
     setCallActive(false);
     vi.advanceTimersByTime(500);
     expect(onExpired).not.toHaveBeenCalled();
@@ -85,7 +93,7 @@ describe("RealtimeConsentWindow", () => {
 
   it("records a response that arrives after the window fired", () => {
     const { window, onExpired, onLateResponse } = makeWindow();
-    window.noteAssistantTurn("Do you consent to this call being recorded?");
+    window.noteAssistantTurn();
     vi.advanceTimersByTime(500);
     expect(onExpired).toHaveBeenCalledTimes(1);
     window.noteCallerResponded();
@@ -94,7 +102,7 @@ describe("RealtimeConsentWindow", () => {
 
   it("stops counting down after dispose", () => {
     const { window, onExpired } = makeWindow();
-    window.noteAssistantTurn("Do you consent to this call being recorded?");
+    window.noteAssistantTurn();
     window.dispose();
     vi.advanceTimersByTime(500);
     expect(onExpired).not.toHaveBeenCalled();

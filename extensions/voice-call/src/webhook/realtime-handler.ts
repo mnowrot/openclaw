@@ -71,13 +71,22 @@ const CONSULT_TRANSCRIPT_SETTLE_MAX_MS = 1_000;
 const MAX_PARTIAL_USER_TRANSCRIPT_CHARS = 1_200;
 const RECENT_FINAL_USER_TRANSCRIPT_TTL_MS = 2_000;
 const BARGE_IN_REQUIRED_LOUD_CHUNKS = 2;
+const CONSENT_WINDOW_POLL_MS = 250;
+const CONSENT_WINDOW_END_GRACE_MS = 6_000;
 const logger = createSubsystemLogger("voice-call/realtime");
 
 function buildGreetingInstructions(
   baseInstructions: string | undefined,
   greeting: string | undefined,
+  consentWindowEnabled = false,
 ): string | undefined {
   const trimmedGreeting = greeting?.trim();
+  if (consentWindowEnabled) {
+    const greetingAfterConsent = trimmedGreeting
+      ? `After the caller consents, include this greeting in your next spoken reply: "${trimmedGreeting}"`
+      : undefined;
+    return [baseInstructions, greetingAfterConsent].filter(Boolean).join("\n\n") || undefined;
+  }
   if (!trimmedGreeting) {
     return undefined;
   }
@@ -870,7 +879,11 @@ export class RealtimeCallHandler {
         "[voice-call] This realtime model uses native agent delegation; the end-call and custom realtime function tools are unavailable.",
       );
     }
-    const initialGreetingInstructions = buildGreetingInstructions(instructions, initialGreeting);
+    const initialGreetingInstructions = buildGreetingInstructions(
+      instructions,
+      initialGreeting,
+      this.config.consentWindow.enabled,
+    );
     const harness = createRealtimeVoiceSessionHarness({
       talk: {
         sessionId: `voice-call:${callId}:realtime`,
@@ -997,28 +1010,39 @@ export class RealtimeCallHandler {
     let sessionClosed = false;
     let lastAssistantAudioSentAt = 0;
     const ASSISTANT_SPEECH_TAIL_MS = 400;
-    const CONSENT_WINDOW_MS = 5_000;
-    const CONSENT_WINDOW_POLL_MS = 250;
-    const CONSENT_WINDOW_END_GRACE_MS = 6_000;
-    // The agent is told to give the caller a few seconds to answer the opening consent question
-    // and then apologise + end the call, but nothing wakes the model on silence - the line just
-    // stays open. The window only arms for the first assistant question before any caller
-    // response, so an ordinary later question can never end a live call.
+    const consentWindowMs = this.config.consentWindow.windowMs;
+    // Config explicitly admits this flow and adds the opening question to the provider
+    // instructions. Transcript punctuation is not an activation signal.
     const endConsentCallDirectly = (): void => {
       const grace = setTimeout(() => {
         if (sessionClosed || this.activeBridgesByCallId.get(callId) !== session) {
           return;
         }
-        void this.manager.endCall(callId, { reason: "timeout" }).catch((error: unknown) => {
-          console.warn(
-            `[voice-call] realtime consent end-call failed callId=${callId} providerCallId=${callSid}: ${formatErrorMessage(error)}`,
-          );
-        });
+        const attempt = this.manager
+          .endCall(callId, { reason: "timeout" })
+          .then((result) => {
+            if (!result.success) {
+              console.warn(
+                `[voice-call] Failed to end realtime consent call callId=${callId} providerCallId=${callSid} reason=timeout: ${result.error ?? "unknown error"}; call remains active`,
+              );
+              return;
+            }
+            console.log(
+              `[voice-call] Realtime consent call ended callId=${callId} providerCallId=${callSid}`,
+            );
+          })
+          .catch((error: unknown) => {
+            console.warn(
+              `[voice-call] Failed to end realtime consent call callId=${callId} providerCallId=${callSid} reason=timeout: ${formatErrorMessage(error)}; call remains active`,
+            );
+          });
+        this.trackShutdownWork(attempt, this.terminationAttempts);
       }, CONSENT_WINDOW_END_GRACE_MS);
       grace.unref?.();
     };
     const consentWindow = new RealtimeConsentWindow({
-      windowMs: CONSENT_WINDOW_MS,
+      enabled: this.config.consentWindow.enabled,
+      windowMs: consentWindowMs,
       pollMs: CONSENT_WINDOW_POLL_MS,
       isBotSpeaking: () =>
         audioPacer.hasPendingAudio() ||
@@ -1026,22 +1050,22 @@ export class RealtimeCallHandler {
       isCallActive: () => !sessionClosed && this.activeBridgesByCallId.get(callId) === session,
       onExpired: () => {
         console.log(
-          `[voice-call] realtime consent window expired callId=${callId} providerCallId=${callSid} windowMs=${CONSENT_WINDOW_MS} - instructing the agent to apologise and end the call`,
+          `[voice-call] realtime consent window expired callId=${callId} providerCallId=${callSid} windowMs=${consentWindowMs} - instructing the agent to apologise and end the call`,
         );
-        // Native agent delegation does not expose the end-call tool to the provider, so the
-        // injected instruction would be unsatisfiable and the line would stay open. Ask for the
-        // spoken goodbye only when the tool is actually available; either way, never hold the line.
-        const endCallToolAvailable = !handlesAgentConsult && toolPolicy !== "none";
-        if (endCallToolAvailable) {
-          try {
-            session.sendUserMessage(
-              `NO CONSENT ANSWER RECEIVED. The caller did not answer your consent question within five seconds. Apologise briefly and warmly in ONE short sentence that ends with the word "Goodbye.", then call ${REALTIME_VOICE_END_CALL_TOOL_NAME} immediately. Do not ask again.`,
-            );
-          } catch (error) {
-            console.warn(
-              `[voice-call] realtime consent window prompt failed callId=${callId}: ${formatErrorMessage(error)}`,
-            );
-          }
+        // Native delegation hides function tools. Consult policy does not: the built-in end-call
+        // tool remains available whenever provider function tools are available.
+        const endCallToolAvailable = !handlesAgentConsult;
+        const hangupInstruction = endCallToolAvailable
+          ? ` Then call ${REALTIME_VOICE_END_CALL_TOOL_NAME} immediately.`
+          : " The host will end the call after you speak.";
+        try {
+          session.sendUserMessage(
+            `NO CONSENT ANSWER RECEIVED. The caller did not answer your consent question within the configured response window. Apologise briefly and warmly in ONE short sentence that ends with the word "Goodbye."${hangupInstruction} Do not ask again.`,
+          );
+        } catch (error) {
+          console.warn(
+            `[voice-call] realtime consent window prompt failed callId=${callId}: ${formatErrorMessage(error)}`,
+          );
         }
         endConsentCallDirectly();
       },
@@ -1144,7 +1168,8 @@ export class RealtimeCallHandler {
           }
         : {}),
       initialGreetingInstructions,
-      triggerGreetingOnReady: Boolean(initialGreetingInstructions),
+      triggerGreetingOnReady:
+        Boolean(initialGreetingInstructions) || this.config.consentWindow.enabled,
       audioSink: {
         isOpen: () => !sessionClosed && ws.readyState === WebSocket.OPEN,
         sendAudio: (muLaw, metadata) => {
@@ -1276,9 +1301,7 @@ export class RealtimeCallHandler {
           void transcriptPersistence.catch(reportTranscriptFailure);
           return;
         }
-        if (text.includes("?")) {
-          consentWindow.noteAssistantTurn(text);
-        }
+        consentWindow.noteAssistantTurn();
         transcriptPersistence = this.manager
           .processEvent({
             id: `realtime-bot-${callSid}-${randomUUID()}`,
