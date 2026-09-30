@@ -85,6 +85,11 @@ const CONSENT_WINDOW_MAX_CLOSE_WAIT_MS = 20_000;
 // answer window only starts once the carrier has played the question; if no mark comes back we still
 // arm, so a silent carrier cannot disable the watchdog entirely.
 const CONSENT_QUESTION_PLAYBACK_WAIT_MS = 5_000;
+// Last-resort bound on waiting for the consent question's response to complete before queueing its
+// playback mark. The mark must follow the question audio, so it is normally queued when the provider
+// reports the response done; this deadline only exists so a provider that never reports completion
+// cannot stall the watchdog behind an unresolved mark.
+const CONSENT_QUESTION_PLAYBACK_REQUEST_DEADLINE_MS = 5_000;
 const logger = createSubsystemLogger("voice-call/realtime");
 
 function buildGreetingInstructions(
@@ -963,6 +968,11 @@ export class RealtimeCallHandler {
     let consentQuestionPlaybackAcked = false;
     let consentQuestionMarkResolved = false;
     let consentQuestionMarkRequested = false;
+    // Set once the finalized consent-question turn is seen, cleared when its playback mark is
+    // requested. The request itself waits for the question's response to complete so the mark cannot
+    // be acknowledged ahead of the question audio.
+    let consentQuestionAwaitingPlaybackConfirmation = false;
+    let consentQuestionPlaybackRequestDeadline: ReturnType<typeof setTimeout> | undefined;
     const ASSISTANT_SPEECH_TAIL_MS = 400;
     const consentWindowMs = this.config.consentWindow.windowMs;
     // Config explicitly admits this flow and adds the opening question to the provider
@@ -1111,6 +1121,24 @@ export class RealtimeCallHandler {
         consentQuestionMarkResolved = true;
       }, CONSENT_QUESTION_PLAYBACK_WAIT_MS);
       fallback.unref?.();
+    };
+    // Queue the answer-window playback mark once the consent question's *output audio* has finished
+    // arriving, not when its transcript is finalized: Google Live appends the finished output
+    // transcription before the audio parts of the same server message, so requesting the mark from
+    // the transcript callback could queue it ahead of the question audio and let the carrier
+    // acknowledge a mark before the caller ever heard the question. The provider reports the
+    // response complete after the model turn, so use that; a bounded deadline is the last-resort
+    // escape so a provider that never reports completion cannot stall the watchdog.
+    const confirmConsentQuestionPlaybackAfterResponse = (): void => {
+      if (!consentQuestionAwaitingPlaybackConfirmation) {
+        return;
+      }
+      consentQuestionAwaitingPlaybackConfirmation = false;
+      if (consentQuestionPlaybackRequestDeadline) {
+        clearTimeout(consentQuestionPlaybackRequestDeadline);
+        consentQuestionPlaybackRequestDeadline = undefined;
+      }
+      requestConsentQuestionPlaybackConfirmation();
     };
     // Provisional ownership accepts callbacks fired during createBridge. Commit
     // retires the predecessor only after creation succeeds; failure restores it.
@@ -1342,10 +1370,21 @@ export class RealtimeCallHandler {
           lastAssistantFinalTurnAt = Date.now();
           // Arm only on the finalized consent turn: a provider may stream the question text and
           // then pause before finishing the utterance, and the answer window must wait until the
-          // carrier has played the question rather than merely drained the local queue.
-          if (isConsentQuestionUtterance(text)) {
-            requestConsentQuestionPlaybackConfirmation();
+          // carrier has played the question rather than merely drained the local queue. Gate on the
+          // opt-in flag so a default-config call never queues a consent mark or logs a missing
+          // acknowledgment for an ordinary opening question.
+          if (this.config.consentWindow.enabled && isConsentQuestionUtterance(text)) {
             consentWindow.noteAssistantTurn();
+            consentQuestionAwaitingPlaybackConfirmation = true;
+            if (!consentQuestionPlaybackRequestDeadline) {
+              consentQuestionPlaybackRequestDeadline = setTimeout(() => {
+                console.warn(
+                  `[voice-call] carrier never reported consent-question response completion callId=${callId} - queueing the playback mark after the bounded wait`,
+                );
+                confirmConsentQuestionPlaybackAfterResponse();
+              }, CONSENT_QUESTION_PLAYBACK_REQUEST_DEADLINE_MS);
+              consentQuestionPlaybackRequestDeadline.unref?.();
+            }
           }
         }
         transcriptPersistence = this.manager
@@ -1444,6 +1483,9 @@ export class RealtimeCallHandler {
         if (outcome.status === "failed" || outcome.status === "incomplete") {
           console.warn(`[voice-call] realtime response ${outcome.status}: ${outcome.message}`);
         }
+        // The consent question's output audio has finished arriving; only now may its playback mark
+        // be queued so it cannot be acknowledged ahead of the question.
+        confirmConsentQuestionPlaybackAfterResponse();
       },
       onReady: () => {
         harness.emit({

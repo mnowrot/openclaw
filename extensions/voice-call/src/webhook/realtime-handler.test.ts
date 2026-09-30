@@ -1657,6 +1657,9 @@ describe("RealtimeCallHandler path routing", () => {
 
       vi.useFakeTimers();
       callbacks?.onTranscript?.("assistant", "Do you consent to this call being recorded?", true);
+      // The provider reports the question response complete after its model turn; the playback mark
+      // is queued from there so it cannot be acknowledged ahead of the question audio.
+      callbacks?.onResponseDone?.({ status: "completed", responseId: "response-1" });
       vi.advanceTimersByTime(31_000);
       await Promise.resolve();
 
@@ -1709,6 +1712,7 @@ describe("RealtimeCallHandler path routing", () => {
 
       vi.useFakeTimers();
       callbacks?.onTranscript?.("assistant", "Do you consent to this call being recorded?", true);
+      callbacks?.onResponseDone?.({ status: "completed", responseId: "response-1" });
       vi.advanceTimersByTime(31_000);
       await Promise.resolve();
 
@@ -1718,6 +1722,53 @@ describe("RealtimeCallHandler path routing", () => {
         expect.stringContaining("could not be closed automatically"),
       );
       expect(ws.readyState).toBe(WebSocket.OPEN);
+    } finally {
+      vi.useRealTimers();
+      warn.mockRestore();
+      ws.terminate();
+      await handler.close();
+      await server.close();
+    }
+  });
+
+  it("does not queue a consent playback mark when the consent window is disabled", async () => {
+    let callbacks: RealtimeBridgeRequest | undefined;
+    const createBridge = vi.fn((request: RealtimeBridgeRequest) => {
+      callbacks = request;
+      return makeBridge();
+    });
+    const call = makeCallRecord("CA-consent-mark-disabled");
+    const endCall = vi.fn(async () => ({ success: true }));
+    const handler = makeHandler(undefined, {
+      manager: {
+        endCall,
+        getCallByProviderCallId: vi.fn(() => call),
+      },
+      realtimeProvider: makeRealtimeProvider(createBridge),
+    });
+    const server = await startRealtimeServer(handler);
+    const ws = await connectWs(server.url);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      ws.send(
+        JSON.stringify({
+          event: "start",
+          start: { streamSid: "MZ-consent-mark-disabled", callSid: call.providerCallId },
+        }),
+      );
+      await waitForRealtimeTest(() => expect(createBridge).toHaveBeenCalledOnce());
+
+      vi.useFakeTimers();
+      // Even the canonical consent question must not request a carrier mark on a default-config
+      // call: the opt-in flag, not transcript punctuation, admits the flow.
+      callbacks?.onTranscript?.("assistant", "Do you consent to this call being recorded?", true);
+      callbacks?.onResponseDone?.({ status: "completed", responseId: "response-1" });
+      vi.advanceTimersByTime(20_000);
+      await Promise.resolve();
+
+      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("consent-question"));
+      expect(endCall).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
       warn.mockRestore();
@@ -1859,8 +1910,17 @@ describe("RealtimeCallHandler path routing", () => {
       expect(sendUserMessage).not.toHaveBeenCalled();
       expect(endCall).not.toHaveBeenCalled();
 
-      // The finalized turn arms it, and the silent caller is then closed.
+      // The finalized turn arms the window, but the playback mark must wait until the question's
+      // response completes; only then may the answer window count down and the silent caller be
+      // closed.
       callbacks?.onTranscript?.("assistant", "Do you consent to this call being recorded?", true);
+      vi.advanceTimersByTime(1_000);
+      await Promise.resolve();
+      expect(sendUserMessage).not.toHaveBeenCalled();
+      expect(endCall).not.toHaveBeenCalled();
+
+      // The provider reports the question response complete after its model turn.
+      callbacks?.onResponseDone?.({ status: "completed", responseId: "response-1" });
       vi.advanceTimersByTime(31_000);
       await Promise.resolve();
       expect(sendUserMessage).toHaveBeenCalledOnce();
