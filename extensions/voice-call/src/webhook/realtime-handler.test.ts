@@ -1713,9 +1713,7 @@ describe("RealtimeCallHandler path routing", () => {
       await Promise.resolve();
 
       expect(endCall).toHaveBeenCalledExactlyOnceWith("call-1", { reason: "timeout" });
-      expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining("carrier rejected hangup"),
-      );
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("carrier rejected hangup"));
       expect(sendUserMessage).toHaveBeenCalledWith(
         expect.stringContaining("could not be closed automatically"),
       );
