@@ -107,4 +107,20 @@ describe("RealtimeConsentWindow", () => {
     vi.advanceTimersByTime(500);
     expect(onExpired).not.toHaveBeenCalled();
   });
+
+  it("holds the countdown for the unconfirmed-playback grace", () => {
+    const { window, onExpired } = makeWindow({ windowMsExtension: () => 5_000 });
+    window.noteAssistantTurn();
+    vi.advanceTimersByTime(1_000);
+    expect(onExpired).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(4_500);
+    expect(onExpired).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts the full window immediately once playback is confirmed", () => {
+    const { window, onExpired } = makeWindow({ windowMsExtension: () => 0 });
+    window.noteAssistantTurn();
+    vi.advanceTimersByTime(500);
+    expect(onExpired).toHaveBeenCalledTimes(1);
+  });
 });
