@@ -24,7 +24,6 @@ import {
   formatExecApprovalContinuationSourceOutput,
 } from "./bash-tools.exec-approval-output.js";
 import {
-  buildExecApprovalRequesterContext,
   buildExecApprovalTurnSourceContext,
   isExecApprovalRunAbortedError,
   registerExecApprovalRequestForHostOrThrow,
@@ -171,10 +170,8 @@ export async function executeNodeHostCommand(
       ask: hostAsk,
       ...unavailableDecisionRequestParams,
       commandHighlighting: params.commandHighlighting,
-      ...buildExecApprovalRequesterContext({
-        agentId: prepared.agentId,
-        sessionKey: prepared.sessionKey,
-      }),
+      agentId: prepared.agentId,
+      sessionKey: prepared.sessionKey,
       approvalReviewerDeviceIds: params.approvalReviewerDeviceId
         ? [params.approvalReviewerDeviceId]
         : undefined,
@@ -360,15 +357,7 @@ export async function executeNodeHostCommand(
     }
 
     if (!inlineApprovedByAsk) {
-      // Keep routed approvals in the owning turn unless its caller explicitly
-      // delegates completion to a detached follow-up.
-      const approvalRoute = await execHostShared.createExecApprovalRequestRoute({
-        warnings: params.warnings,
-        approvalRunningNoticeMs: params.approvalRunningNoticeMs,
-        createApprovalSlug,
-        turnSourceChannel: params.turnSourceChannel,
-        turnSourceAccountId: params.turnSourceAccountId,
-        register: registerNodeApproval,
+      const approvalDecisionPolicy = {
         askFallback,
         resolveTimedOut: async () => {
           const fallback = await resolveCurrentTimeoutFallback();
@@ -378,9 +367,21 @@ export async function executeNodeHostCommand(
             context: fallback,
           };
         },
-        requiresExplicitApproval: (fallback) =>
-          fallback?.requiresExplicitApproval ?? inlineEvalHit !== null,
+        requiresExplicitApproval: (
+          fallback: Awaited<ReturnType<typeof resolveCurrentTimeoutFallback>> | undefined,
+        ) => fallback?.requiresExplicitApproval ?? inlineEvalHit !== null,
         requiresAutoReviewHumanApproval: autoReviewRequiresHumanApproval,
+      };
+      // Keep routed approvals in the owning turn unless its caller explicitly
+      // delegates completion to a detached follow-up.
+      const approvalRoute = await execHostShared.createExecApprovalRequestRoute({
+        warnings: params.warnings,
+        approvalRunningNoticeMs: params.approvalRunningNoticeMs,
+        createApprovalSlug,
+        turnSourceChannel: params.turnSourceChannel,
+        turnSourceAccountId: params.turnSourceAccountId,
+        register: registerNodeApproval,
+        ...approvalDecisionPolicy,
       });
       const {
         approvalId,
@@ -419,14 +420,7 @@ export async function executeNodeHostCommand(
           approvalId,
           preResolvedDecision,
           signal: params.signal,
-          askFallback,
-          resolveTimedOut: async () => {
-            const fallback = await resolveCurrentTimeoutFallback();
-            return { ...fallback, context: fallback };
-          },
-          requiresExplicitApproval: (fallback) =>
-            fallback?.requiresExplicitApproval ?? inlineEvalHit !== null,
-          requiresAutoReviewHumanApproval: autoReviewRequiresHumanApproval,
+          ...approvalDecisionPolicy,
         });
         params.signal?.throwIfAborted();
         if (outcome.kind !== "resolved") {
@@ -478,18 +472,7 @@ export async function executeNodeHostCommand(
             approvalId,
             preResolvedDecision,
             signal: params.signal,
-            askFallback,
-            resolveTimedOut: async () => {
-              const fallback = await resolveCurrentTimeoutFallback();
-              return {
-                approvedByAsk: fallback.approvedByAsk,
-                deniedReason: fallback.deniedReason,
-                context: fallback,
-              };
-            },
-            requiresExplicitApproval: (fallback) =>
-              fallback?.requiresExplicitApproval ?? inlineEvalHit !== null,
-            requiresAutoReviewHumanApproval: autoReviewRequiresHumanApproval,
+            ...approvalDecisionPolicy,
           });
           if (approvalOutcome.kind !== "resolved") {
             if (approvalOutcome.kind === "request-failed") {

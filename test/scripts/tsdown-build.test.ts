@@ -6,7 +6,8 @@ import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import * as liveGatewayDistFence from "../../scripts/lib/live-gateway-dist-fence.mts";
 import { readProcessMemoryCapacity } from "../../scripts/lib/process-memory.mts";
 import {
   TSDOWN_NON_SDK_DTS_CONFIG_GROUPS,
@@ -43,6 +44,13 @@ import {
   waitForPidFile,
 } from "../helpers/process-wait.js";
 import { createSourcePluginDependenciesFixture } from "./source-plugin-dependencies-fixture.js";
+
+beforeEach(() => {
+  const fence = vi
+    .spyOn(liveGatewayDistFence, "resolveLiveManagedGatewayDistFence")
+    .mockResolvedValue({ refuse: false });
+  onTestFinished(() => fence.mockRestore());
+});
 
 const fixture = createFixtureLifetime();
 const { createTempDir } = fixture;
@@ -1763,6 +1771,8 @@ describe("resolveTsdownBuildInvocation", () => {
           "dist/control-ui/assets/index-AbCd1234.js.map",
           "dist/control-ui/assets/index-AbCd1234.js.br",
           "dist/control-ui/assets/nested/styles-AbCd1234.css",
+          `dist/control-ui.build-${process.pid}-fixture/assets/lazy.js`,
+          `dist/control-ui.build-${process.pid}-fixture.retired/index.html`,
           "packages/plugin-sdk/dist/keep.js",
           "packages/agent-core/src/keep.ts",
           "tmp/keep.js",
@@ -1938,6 +1948,27 @@ describe("resolveTsdownBuildInvocation", () => {
       await expect(fsPromises.readFile(rootDeclaration, "utf8")).resolves.toBe(malformed);
     }),
   );
+
+  it("refuses a direct tsdown entry before executeBuild when the live Gateway fence trips", () =>
+    fixture.run(async () => {
+      const executeBuild = vi.fn(async () => 0);
+      const resolveLiveGatewayDistFence = vi
+        .spyOn(liveGatewayDistFence, "resolveLiveManagedGatewayDistFence")
+        .mockResolvedValue({
+          refuse: true,
+          message: "[openclaw] Refusing to rebuild dist while a managed Gateway is still running.",
+        });
+
+      await expect(
+        runTsdownBuild(["--config", "tsdown.ai.config.ts"], {
+          cwd: createTempDir("openclaw-tsdown-live-fence-"),
+          executeBuild,
+        }),
+      ).resolves.toBe(1);
+
+      expect(executeBuild).not.toHaveBeenCalled();
+      expect(resolveLiveGatewayDistFence).toHaveBeenCalledOnce();
+    }));
 
   it("keeps a nested packaged Mac app intact while rebuilding its replacement runtime", () =>
     fixture.run(async () => {

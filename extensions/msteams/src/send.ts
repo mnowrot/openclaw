@@ -16,7 +16,11 @@ import {
   formatMSTeamsSendErrorHint,
   formatUnknownError,
 } from "./errors.js";
-import { prepareFileConsentActivityFs, requiresFileConsent } from "./file-consent-helpers.js";
+import {
+  FILE_CONSENT_THRESHOLD_BYTES,
+  prepareFileConsentActivityFs,
+  requiresFileConsent,
+} from "./file-consent-helpers.js";
 import { formatMSTeamsMarkdown } from "./format.js";
 import { buildTeamsFileInfoCard } from "./graph-chat.js";
 import {
@@ -24,7 +28,7 @@ import {
   requireMSTeamsSharePointSiteId,
   uploadAndShareSharePoint,
 } from "./graph-upload.js";
-import { extractFilename, extractMessageId } from "./media-helpers.js";
+import { extractFilename, extractMessageId, MSTEAMS_MAX_MEDIA_BYTES } from "./media-helpers.js";
 import {
   buildMSTeamsAdaptiveCardActivity,
   buildMSTeamsMessageActivity,
@@ -46,13 +50,10 @@ type MSTeamsSendOptions = MSTeamsSendHandoff & {
 };
 
 type SendMSTeamsMessageParams = {
-  /** Full config (for credentials) */
   cfg: OpenClawConfig;
   /** Conversation ID or user ID to send to */
   to: string;
-  /** Message text */
   text: string;
-  /** Optional media URL */
   mediaUrl?: string;
   /** Optional filename override for uploaded media/files */
   filename?: string;
@@ -68,15 +69,6 @@ type SendMSTeamsMessageResult = {
   /** If a FileConsentCard was sent instead of the file, this contains the upload ID */
   pendingUploadId?: string;
 };
-
-/** Threshold for large files that require FileConsentCard flow in personal chats */
-const FILE_CONSENT_THRESHOLD_BYTES = 4 * 1024 * 1024; // 4MB
-
-/**
- * MSTeams-specific media size limit (100MB).
- * Higher than the default to support Teams file-consent and SharePoint uploads.
- */
-const MSTEAMS_MAX_MEDIA_BYTES = 100 * 1024 * 1024;
 
 function createMSTeamsSendError(errorPrefix: string, error: unknown): Error {
   if (
@@ -161,13 +153,10 @@ function createMSTeamsSendResult(params: {
 }
 
 type SendMSTeamsPollParams = {
-  /** Full config (for credentials) */
   cfg: OpenClawConfig;
   /** Conversation ID or user ID to send to */
   to: string;
-  /** Poll question */
   question: string;
-  /** Poll options */
   options: string[];
   /** Max selections (defaults to 1) */
   maxSelections?: number;
@@ -180,15 +169,11 @@ type SendMSTeamsPollResult = {
 };
 
 type SendMSTeamsCardParams = {
-  /** Full config (for credentials) */
   cfg: OpenClawConfig;
   /** Conversation ID or user ID to send to */
   to: string;
-  /** Adaptive Card JSON object */
   card: Record<string, unknown>;
 } & MSTeamsSendOptions;
-
-type SendMSTeamsCardResult = SendMSTeamsMessageResult;
 
 /**
  * Send a message to a Teams conversation or user.
@@ -221,7 +206,6 @@ export async function sendMessageMSTeams(
     hasMedia: Boolean(mediaUrl),
   });
 
-  // Handle media if present
   if (mediaUrl) {
     const mediaMaxBytes = ctx.mediaMaxBytes ?? MSTEAMS_MAX_MEDIA_BYTES;
     const media = await loadOutboundMediaFromUrl(mediaUrl, {
@@ -250,7 +234,6 @@ export async function sendMessageMSTeams(
         conversationType,
         contentType: media.contentType,
         bufferSize: media.buffer.length,
-        thresholdBytes: FILE_CONSENT_THRESHOLD_BYTES,
       })
     ) {
       // Proactive CLI sends run in a different process from the gateway's
@@ -370,13 +353,9 @@ export async function sendMessageMSTeams(
     }
   }
 
-  // No media: send text only
   return sendTextWithMedia(ctx, messageText, undefined, params);
 }
 
-/**
- * Send a text message with optional base64 media URL.
- */
 async function sendTextWithMedia(
   ctx: MSTeamsProactiveContext,
   text: string,
@@ -489,9 +468,6 @@ async function sendProactiveActivity(params: ProactiveActivityParams): Promise<s
   }
 }
 
-/**
- * Send a poll (Adaptive Card) to a Teams conversation or user.
- */
 export async function sendPollMSTeams(
   params: SendMSTeamsPollParams,
 ): Promise<SendMSTeamsPollResult> {
@@ -517,7 +493,6 @@ export async function sendPollMSTeams(
 
   const activity = buildMSTeamsAdaptiveCardActivity(pollCard.card);
 
-  // Send poll via proactive conversation (Adaptive Cards require direct activity send)
   const messageId = await sendProactiveActivity({
     ctx,
     activity,
@@ -535,12 +510,9 @@ export async function sendPollMSTeams(
   };
 }
 
-/**
- * Send an arbitrary Adaptive Card to a Teams conversation or user.
- */
 export async function sendAdaptiveCardMSTeams(
   params: SendMSTeamsCardParams,
-): Promise<SendMSTeamsCardResult> {
+): Promise<SendMSTeamsMessageResult> {
   assertMSTeamsSendHandoff(params);
   const { cfg, to, card } = params;
   const ctx = await resolveMSTeamsSendContext({
@@ -557,7 +529,6 @@ export async function sendAdaptiveCardMSTeams(
 
   const activity = buildMSTeamsAdaptiveCardActivity(card);
 
-  // Send card via proactive conversation
   const messageId = await sendProactiveActivity({
     ctx,
     activity,
@@ -579,7 +550,6 @@ export async function sendAdaptiveCardMSTeams(
 }
 
 type MSTeamsMessageMutationParams = {
-  /** Full config (for credentials) */
   cfg: OpenClawConfig;
   /** Conversation ID or user ID */
   to: string;

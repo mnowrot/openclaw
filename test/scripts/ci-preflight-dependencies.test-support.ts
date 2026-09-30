@@ -1,10 +1,11 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** Execute the workflow's native Node manifest with runtime dependencies forbidden. */
 export function runDependencyFreePreflight(
-  source: string,
+  entrypoint: URL,
   directory: string,
   nodeExecPath: string,
 ) {
@@ -16,10 +17,6 @@ export function runDependencyFreePreflight(
 import { isBuiltin, registerHooks } from "node:module";
 registerHooks({
   resolve(specifier, context, nextResolve) {
-    // CI materializes these unchanged trusted helpers under its harness checkout.
-    if (specifier.startsWith("./.ci-harness/")) {
-      specifier = "./" + specifier.slice("./.ci-harness/".length);
-    }
     if (!isBuiltin(specifier) && !specifier.startsWith(".") &&
         !specifier.startsWith("file:") && !specifier.startsWith("/")) {
       throw new Error("Unexpected preflight dependency: " + specifier);
@@ -40,26 +37,26 @@ registerHooks({
       delete env[key];
     }
   }
-  const result = spawnSync(nodeExecPath, ["--import", preload, "--input-type=module"], {
+  const result = spawnSync(nodeExecPath, ["--import", preload, fileURLToPath(entrypoint)], {
     cwd: process.cwd(),
-    input: source,
     encoding: "utf8",
     timeout: 30_000,
     killSignal: "SIGKILL",
     env: {
       ...env,
       GITHUB_OUTPUT: output,
-      GITHUB_EVENT_NAME: "pull_request",
+      GITHUB_EVENT_NAME: "workflow_dispatch",
       GITHUB_RUN_ATTEMPT: "1",
-      OPENCLAW_CI_EVENT_NAME: "pull_request",
+      OPENCLAW_CI_EVENT_NAME: "workflow_dispatch",
       OPENCLAW_CI_REPOSITORY: "openclaw/openclaw",
       OPENCLAW_CI_HEAD_REPOSITORY: "openclaw/openclaw",
       OPENCLAW_CI_RUNNER_PROFILE: "github",
-      OPENCLAW_CI_RUN_NODE: "true",
+      OPENCLAW_CI_RUN_NODE: "false",
       OPENCLAW_CI_RUN_WINDOWS: "true",
-      // A product test keeps the real import guard on precise planning; tooling
-      // owners select the full maintainer plan, whose packing is covered separately.
-      OPENCLAW_CI_CHANGED_PATHS_JSON: '["src/infra/retry.test.ts"]',
+      OPENCLAW_CI_RUN_UI_TESTS: "true",
+      // Exercise real planner and codec imports without a repository-wide PR
+      // owner graph. Changed-owner selection has separate integration coverage.
+      OPENCLAW_CI_CHANGED_PATHS_JSON: "[]",
     },
   });
   return {

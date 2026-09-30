@@ -1,3 +1,4 @@
+import { safeParseJsonRecord } from "@openclaw/normalization-core/json-coercion";
 import { asPositiveFiniteNumber } from "@openclaw/normalization-core/number-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import {
@@ -239,18 +240,6 @@ function isClaudeToolResultError(content: unknown): boolean {
   return isRecord(content) && typeof content.type === "string" && content.type.endsWith("_error");
 }
 
-function parseToolInputJson(parts: string[]): Record<string, unknown> {
-  if (parts.length === 0) {
-    return {};
-  }
-  try {
-    const parsed: unknown = JSON.parse(parts.join(""));
-    return isRecord(parsed) ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
 function emitClaudeToolResultBlock(
   tracker: ToolUseTracker,
   block: Record<string, unknown>,
@@ -326,7 +315,7 @@ export function dispatchClaudeCliStreamingToolEvent(params: {
         // start snapshot overwrite it.
         const args =
           pending.inputJsonParts.length > 0
-            ? parseToolInputJson(pending.inputJsonParts)
+            ? (safeParseJsonRecord(pending.inputJsonParts.join("")) ?? {})
             : (pending.blockInput ?? {});
         emitToolStartOnce(
           tracker,
@@ -433,10 +422,6 @@ function beginClaudeContentBlock(tracker: ThinkingTracker, index: unknown): void
   tracker.nextSyntheticBlockIndex += 1;
 }
 
-function stopClaudeContentBlock(tracker: ThinkingTracker): void {
-  tracker.currentSyntheticBlockIndex = undefined;
-}
-
 function resolveClaudeContentBlockIndex(tracker: ThinkingTracker, index: unknown): number | null {
   if (typeof index === "number") {
     tracker.nextSyntheticBlockIndex = Math.max(tracker.nextSyntheticBlockIndex, index + 1);
@@ -478,15 +463,6 @@ function readThinkingProgressTokens(delta: Record<string, unknown>): number | un
   return asPositiveFiniteNumber(delta.estimated_tokens);
 }
 
-function emitClaudeThinkingProgress(
-  tracker: ThinkingTracker,
-  progressTokensDelta: number,
-  onThinkingProgress: (progress: CliThinkingProgress) => void,
-): void {
-  tracker.progressTokens += progressTokensDelta;
-  onThinkingProgress({ progressTokens: tracker.progressTokens });
-}
-
 export function dispatchClaudeCliThinking(params: {
   backend: CliBackendConfig;
   providerId: string;
@@ -515,7 +491,7 @@ export function dispatchClaudeCliThinking(params: {
       return;
     }
     if (event.type === "content_block_stop") {
-      stopClaudeContentBlock(tracker);
+      tracker.currentSyntheticBlockIndex = undefined;
       return;
     }
     if (event.type !== "content_block_delta" || !isRecord(event.delta)) {
@@ -528,8 +504,10 @@ export function dispatchClaudeCliThinking(params: {
       return;
     }
     const progressTokensDelta = readThinkingProgressTokens(event.delta);
-    if (progressTokensDelta !== undefined && params.onThinkingProgress) {
-      emitClaudeThinkingProgress(tracker, progressTokensDelta, params.onThinkingProgress);
+    const onThinkingProgress = params.onThinkingProgress;
+    if (progressTokensDelta !== undefined && onThinkingProgress) {
+      tracker.progressTokens += progressTokensDelta;
+      onThinkingProgress({ progressTokens: tracker.progressTokens });
       return;
     }
     // signature_delta carries opaque continuation material; the Claude CLI owns

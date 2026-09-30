@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { runInNewContext } from "node:vm";
 import { expectDefined } from "@openclaw/normalization-core";
 import { globSync } from "tinyglobby";
 import { afterEach, describe, expect, it } from "vitest";
@@ -105,10 +106,152 @@ function releaseArtifactFiles(workflowFile: string, artifactPrefix: string, runn
 }
 
 describe("mobile release CI tools", () => {
+  it("routes daily and manual TestFlight through qualification and its unattended environment", () => {
+    const workflow = parse(fs.readFileSync(".github/workflows/ios-store-release.yml", "utf8")) as {
+      on: { schedule: Array<{ cron: string; timezone: string }> };
+      concurrency: { group: string; "cancel-in-progress": boolean };
+      jobs: {
+        qualify: { if: string };
+        release: { if: string; environment: string; steps: WorkflowStep[] };
+        screenshots: { if: string };
+      };
+    };
+    expect(workflow.on.schedule).toEqual([{ cron: "0 7 * * *", timezone: "America/Los_Angeles" }]);
+    expect(workflow.concurrency).toMatchObject({
+      group: "ios-release",
+      "cancel-in-progress": false,
+    });
+    const upload = expectDefined(
+      workflow.jobs.release.steps.find((step) => step.name === "Prepare and upload iOS release"),
+      "iOS upload step",
+    );
+    const uploadEnvironment = expectDefined(upload.env, "iOS upload environment");
+
+    for (const scenario of [
+      {
+        event: "schedule",
+        operation: "",
+        enabled: "true",
+        admitted: true,
+        destination: "testflight",
+      },
+      { event: "schedule", operation: "", enabled: "", admitted: false },
+      { event: "schedule", operation: "", enabled: "false", admitted: false },
+      {
+        event: "workflow_dispatch",
+        operation: "testflight",
+        enabled: "false",
+        admitted: true,
+        destination: "testflight",
+      },
+      {
+        event: "workflow_dispatch",
+        operation: "release",
+        enabled: "false",
+        admitted: true,
+        destination: "app-store",
+      },
+      {
+        event: "workflow_dispatch",
+        operation: "screenshots",
+        enabled: "true",
+        admitted: false,
+        screenshots: true,
+        ref: "refs/heads/candidate",
+      },
+      {
+        event: "workflow_dispatch",
+        operation: "testflight",
+        enabled: "true",
+        admitted: false,
+        ref: "refs/heads/candidate",
+      },
+      {
+        event: "schedule",
+        operation: "",
+        enabled: "true",
+        admitted: false,
+        repository: "example/fork",
+      },
+      { event: "push", operation: "release", enabled: "true", admitted: false },
+    ]) {
+      const context = {
+        github: {
+          event_name: scenario.event,
+          ref: scenario.ref ?? "refs/heads/main",
+          repository: scenario.repository ?? "openclaw/openclaw",
+        },
+        inputs: { operation: scenario.operation },
+        vars: {
+          IOS_TESTFLIGHT_ENABLED: scenario.enabled,
+          OPENCLAW_TESTFLIGHT_GROUP_ID: "external-group-id",
+        },
+      };
+      const evaluate = (expression: string) =>
+        runInNewContext(expression.replace(/^\$\{\{\s*|\s*\}\}$/gu, ""), context);
+      expect(Boolean(evaluate(workflow.jobs.qualify.if)), JSON.stringify(scenario)).toBe(
+        scenario.admitted,
+      );
+      expect(Boolean(evaluate(workflow.jobs.release.if)), JSON.stringify(scenario)).toBe(
+        scenario.admitted,
+      );
+      expect(Boolean(evaluate(workflow.jobs.screenshots.if))).toBe(scenario.screenshots ?? false);
+      if (!scenario.admitted) {
+        continue;
+      }
+      expect(evaluate(workflow.jobs.release.environment)).toBe(
+        scenario.destination === "testflight" ? "ios-testflight" : "ios-store-release",
+      );
+      expect(
+        evaluate(
+          expectDefined(
+            uploadEnvironment.OPENCLAW_TESTFLIGHT_GROUP_ID,
+            "TestFlight group expression",
+          ),
+        ),
+      ).toBe("external-group-id");
+      const result = spawnSync(
+        "bash",
+        [
+          "-c",
+          [
+            "gh() { :; }",
+            "pnpm() { printf '%s\\n' \"$@\"; }",
+            expectDefined(upload.run, "iOS upload command"),
+          ].join("\n"),
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            IOS_RELEASE_DESTINATION: String(
+              evaluate(
+                expectDefined(
+                  uploadEnvironment.IOS_RELEASE_DESTINATION,
+                  "iOS release destination expression",
+                ),
+              ),
+            ),
+            RUNNER_TEMP: "/synthetic-runner-temp",
+          },
+        },
+      );
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout.trim().split("\n")).toEqual([
+        "ios:release:upload",
+        "--",
+        "--destination",
+        scenario.destination,
+        "--recovery-dir",
+        "/synthetic-runner-temp/ios-release-recovery",
+      ]);
+    }
+  });
+
   describe.each([
     {
       platform: "ios",
-      workflow: ".github/workflows/ios-release.yml",
+      workflow: ".github/workflows/ios-store-release.yml",
       buildDirectory: "app-store",
       binaries: ["OpenClaw.ipa", "OpenClaw.ipa.sha256"],
     },
@@ -220,7 +363,7 @@ describe("mobile release CI tools", () => {
       }
       expect(
         releaseArtifactFiles(
-          ".github/workflows/ios-release.yml",
+          ".github/workflows/ios-store-release.yml",
           "ios-release-screenshot-diagnostics-",
           runnerTemp,
         ),
@@ -1463,7 +1606,7 @@ fi
   });
 
   it("runs the iOS signing proof through the prepared Fastlane environment", () => {
-    const source = fs.readFileSync(".github/workflows/ios-release.yml", "utf8");
+    const source = fs.readFileSync(".github/workflows/ios-store-release.yml", "utf8");
     const workflow = parse(source) as {
       jobs: {
         release: {
@@ -2068,7 +2211,7 @@ process.stdout.write(JSON.stringify({ elapsedMs: Date.now() - startedAt, message
   });
 
   it("installs the pinned Watch Rust toolchain before iOS store access", () => {
-    const source = fs.readFileSync(".github/workflows/ios-release.yml", "utf8");
+    const source = fs.readFileSync(".github/workflows/ios-store-release.yml", "utf8");
     const workflow = parse(source) as {
       jobs: {
         release: {

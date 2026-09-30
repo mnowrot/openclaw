@@ -8,6 +8,7 @@ import { resolveReplyCompletion, resolveReplyExpectation } from "../../reply-com
 import { TOOL_FAILURE_INSTRUCTION } from "../../tool-outcome-instructions.js";
 import { resolveSourceReplyDelivery } from "../delivery-evidence.js";
 import { isZeroUsageEmptyStopAssistantTurn } from "../empty-assistant-turn.js";
+import { assessLastAssistantMessage } from "../thinking.js";
 import {
   hasAsyncActivity,
   hasAttemptTerminalState,
@@ -18,8 +19,6 @@ import {
   classifyAssistantTurn,
   hasPositiveOutputTokenUsage,
   isOllamaIncompleteTurnProvider,
-  isReasoningOnlyAssistantTurn,
-  isUnsignedThinkingOnlyAssistantTurn,
   joinAssistantTexts,
   shouldApplyNonVisibleTurnRetryGuard,
   type IncompleteTurnAttempt,
@@ -56,15 +55,13 @@ export function shouldRetrySilentErrorAssistantTurn(params: {
   >;
   assistant: EmbeddedRunAttemptResult["lastAssistant"] | null | undefined;
 }): boolean {
-  if (joinAssistantTexts(params.attempt.assistantTexts).length > 0) {
-    return false;
-  }
-  if (hasAttemptTerminalState(params.attempt)) {
-    return false;
-  }
   // Current-attempt evidence avoids blocking on prior committed effects; older
   // harnesses retain the cumulative, fail-closed behavior.
-  if (!isCurrentAttemptReplaySafe(params.attempt)) {
+  if (
+    joinAssistantTexts(params.attempt.assistantTexts).length > 0 ||
+    hasAttemptTerminalState(params.attempt) ||
+    !isCurrentAttemptReplaySafe(params.attempt)
+  ) {
     return false;
   }
 
@@ -155,26 +152,22 @@ export function resolveReasoningOnlyRetryInstruction(params: {
   timedOut: boolean;
   attempt: IncompleteTurnAttempt;
 }): string | null {
-  if (shouldSkipNonVisibleTurnRetry(params)) {
-    return null;
-  }
-
-  if (!shouldApplyNonVisibleTurnRetryGuard(params)) {
+  if (shouldSkipNonVisibleTurnRetry(params) || !shouldApplyNonVisibleTurnRetryGuard(params)) {
     return null;
   }
 
   const assistant = resolveCurrentAttemptAssistant(params.attempt);
-  if (joinAssistantTexts(params.attempt.assistantTexts).length > 0) {
-    return null;
-  }
-  if (assistant?.stopReason === "error") {
-    return null;
-  }
-  if (!isReasoningOnlyAssistantTurn(assistant) && !isUnsignedThinkingOnlyAssistantTurn(assistant)) {
-    return null;
-  }
-
-  return REASONING_ONLY_RETRY_INSTRUCTION;
+  // Unsigned thinking blocks have no cryptographic signature; assessLastAssistantMessage
+  // returns "incomplete-thinking" for them. Empty content also returns "incomplete-thinking",
+  // so the content.length > 0 guard is required to distinguish the two cases.
+  return joinAssistantTexts(params.attempt.assistantTexts).length === 0 &&
+    assistant &&
+    assistant.stopReason !== "error" &&
+    Array.isArray(assistant.content) &&
+    assistant.content.length > 0 &&
+    assessLastAssistantMessage(assistant) !== "valid"
+    ? REASONING_ONLY_RETRY_INSTRUCTION
+    : null;
 }
 
 type SettledToolCall = { id: string | null; name: string | null };
