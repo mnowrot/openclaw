@@ -85,11 +85,6 @@ const CONSENT_WINDOW_MAX_CLOSE_WAIT_MS = 20_000;
 // answer window only starts once the carrier has played the question; if no mark comes back we still
 // arm, so a silent carrier cannot disable the watchdog entirely.
 const CONSENT_QUESTION_PLAYBACK_WAIT_MS = 5_000;
-// Last-resort bound on waiting for the consent question's response to complete before queueing its
-// playback mark. The mark must follow the question audio, so it is normally queued when the provider
-// reports the response done; this deadline only exists so a provider that never reports completion
-// cannot stall the watchdog behind an unresolved mark.
-const CONSENT_QUESTION_PLAYBACK_REQUEST_DEADLINE_MS = 5_000;
 const logger = createSubsystemLogger("voice-call/realtime");
 
 function buildGreetingInstructions(
@@ -972,7 +967,6 @@ export class RealtimeCallHandler {
     // requested. The request itself waits for the question's response to complete so the mark cannot
     // be acknowledged ahead of the question audio.
     let consentQuestionAwaitingPlaybackConfirmation = false;
-    let consentQuestionPlaybackRequestDeadline: ReturnType<typeof setTimeout> | undefined;
     const ASSISTANT_SPEECH_TAIL_MS = 400;
     const consentWindowMs = this.config.consentWindow.windowMs;
     // Config explicitly admits this flow and adds the opening question to the provider
@@ -1127,17 +1121,14 @@ export class RealtimeCallHandler {
     // transcription before the audio parts of the same server message, so requesting the mark from
     // the transcript callback could queue it ahead of the question audio and let the carrier
     // acknowledge a mark before the caller ever heard the question. The provider reports the
-    // response complete after the model turn, so use that; a bounded deadline is the last-resort
-    // escape so a provider that never reports completion cannot stall the watchdog.
+    // response complete after the model turn, so the mark is queued only from that signal; a
+    // provider that never reports completion leaves the watchdog un-armed rather than risking an
+    // early hangup.
     const confirmConsentQuestionPlaybackAfterResponse = (): void => {
       if (!consentQuestionAwaitingPlaybackConfirmation) {
         return;
       }
       consentQuestionAwaitingPlaybackConfirmation = false;
-      if (consentQuestionPlaybackRequestDeadline) {
-        clearTimeout(consentQuestionPlaybackRequestDeadline);
-        consentQuestionPlaybackRequestDeadline = undefined;
-      }
       requestConsentQuestionPlaybackConfirmation();
     };
     // Provisional ownership accepts callbacks fired during createBridge. Commit
@@ -1376,15 +1367,6 @@ export class RealtimeCallHandler {
           if (this.config.consentWindow.enabled && isConsentQuestionUtterance(text)) {
             consentWindow.noteAssistantTurn();
             consentQuestionAwaitingPlaybackConfirmation = true;
-            if (!consentQuestionPlaybackRequestDeadline) {
-              consentQuestionPlaybackRequestDeadline = setTimeout(() => {
-                console.warn(
-                  `[voice-call] carrier never reported consent-question response completion callId=${callId} - queueing the playback mark after the bounded wait`,
-                );
-                confirmConsentQuestionPlaybackAfterResponse();
-              }, CONSENT_QUESTION_PLAYBACK_REQUEST_DEADLINE_MS);
-              consentQuestionPlaybackRequestDeadline.unref?.();
-            }
           }
         }
         transcriptPersistence = this.manager

@@ -46,6 +46,10 @@ describe("Voice Call provider-owned delegation", () => {
 
       vi.useFakeTimers();
       request?.onTranscript?.("assistant", "Do you consent to this call being recorded?", true);
+      // The consent playback mark is queued only once the provider reports the response done (after
+      // the question audio), so the watchdog only arms from that signal; fire it before the window
+      // is allowed to expire.
+      request?.onResponseDone?.({ status: "completed", responseId: "response-1" });
       // No goodbye audio is emitted by the stubbed bridge, so the close waits out the
       // bounded 20s ceiling before ending the call.
       vi.advanceTimersByTime(31_000);
