@@ -948,6 +948,10 @@ export class RealtimeCallHandler {
     let provisionalCloseReason: RealtimeVoiceCloseReason | undefined;
     let sessionClosed = false;
     let lastAssistantAudioSentAt = 0;
+    // When the provider finalized its last assistant turn. A finalized goodbye turn -- not merely a
+    // gap in the audio -- is what tells us the sentence finished, so a mid-sentence pause cannot be
+    // mistaken for the end of the goodbye.
+    let lastAssistantFinalTurnAt = 0;
     const ASSISTANT_SPEECH_TAIL_MS = 400;
     const consentWindowMs = this.config.consentWindow.windowMs;
     // Config explicitly admits this flow and adds the opening question to the provider
@@ -978,15 +982,20 @@ export class RealtimeCallHandler {
         }
         const elapsedMs = Date.now() - promptedAt;
         const goodbyeStarted = lastAssistantAudioSentAt > promptedAt;
+        // A finalized goodbye turn is the signal that the sentence is complete; an audio gap alone
+        // (the 400 ms tail) can fall inside a mid-sentence pause, so never place the tail mark or
+        // close on a pause.
+        const goodbyeTurnFinal = lastAssistantFinalTurnAt > promptedAt;
         const queueDrained =
           !audioPacer.hasPendingAudio() &&
           Date.now() - lastAssistantAudioSentAt >= ASSISTANT_SPEECH_TAIL_MS;
         if (elapsedMs < CONSENT_WINDOW_MAX_CLOSE_WAIT_MS) {
-          const readyToClose = goodbyeStarted && queueDrained && goodbyeMarkAcknowledged;
+          const readyToClose =
+            goodbyeStarted && goodbyeTurnFinal && queueDrained && goodbyeMarkAcknowledged;
           if (!readyToClose) {
-            // The goodbye has stopped locally but the carrier has not yet confirmed playout;
+            // The goodbye has finished locally but the carrier has not yet confirmed playout;
             // place one mark at the tail and wait for its acknowledgement.
-            if (goodbyeStarted && queueDrained && !goodbyeMarkName) {
+            if (goodbyeStarted && goodbyeTurnFinal && queueDrained && !goodbyeMarkName) {
               goodbyeMarkName = `consent-goodbye-${randomUUID()}`;
               pendingMarkAcks.set(goodbyeMarkName, () => {
                 goodbyeMarkAcknowledged = true;
@@ -1286,6 +1295,9 @@ export class RealtimeCallHandler {
         }
         if (isConsentQuestionUtterance(text)) {
           consentWindow.noteAssistantTurn();
+        }
+        if (isFinal) {
+          lastAssistantFinalTurnAt = Date.now();
         }
         transcriptPersistence = this.manager
           .processEvent({
