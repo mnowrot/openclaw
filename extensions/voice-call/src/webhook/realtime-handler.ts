@@ -1046,7 +1046,8 @@ export class RealtimeCallHandler {
     const consentWindow = new RealtimeConsentWindow({
       enabled: this.config.consentWindow.enabled,
       windowMs: consentWindowMs,
-      windowMsExtension: () => (consentQuestionPlaybackAcked ? 0 : CONSENT_QUESTION_PLAYBACK_WAIT_MS),
+      windowMsExtension: () =>
+        consentQuestionPlaybackAcked ? 0 : CONSENT_QUESTION_PLAYBACK_WAIT_MS,
       pollMs: CONSENT_WINDOW_POLL_MS,
       isBotSpeaking: () =>
         audioPacer.hasPendingAudio() ||
