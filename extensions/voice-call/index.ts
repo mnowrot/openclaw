@@ -302,21 +302,39 @@ export default definePluginEntry({
       }
     };
 
-    const ensureRuntimeForCommands = async (): Promise<VoiceCallRuntime> => {
-      // This registration's enabled/validation policy applies before any runtime is selected, so a
-      // reload that disabled or misconfigured voice calling cannot act through a predecessor's
-      // still-running runtime.
+    const assertCurrentRuntimeRegistration = (): void => {
+      if (runtimeCoordinator.current !== runtimeRegistration) {
+        throw new VoiceCallRuntimeLifecycleError(
+          "Voice call runtime generation was superseded; use the current plugin registration",
+        );
+      }
+      if (runtimeRegistration.generation.retired) {
+        throw new VoiceCallRuntimeLifecycleError(
+          "Voice call runtime generation is retired; use the current plugin registration",
+        );
+      }
+    };
+    const ensureRuntimeForExistingCall = async () => {
+      // The current registration's enabled/validation policy applies before any runtime is
+      // selected, so a disabled or misconfigured reload cannot borrow predecessor authority.
       assertRuntimePolicy();
-      // Reuse the live runtime while a call is in flight instead of forcing a fresh
-      // ensureRuntime() pass: the latter can spawn a second runtime (and its webhook
-      // listener) while the first is still serving the active call.
+      // Existing-call control stays on the live runtime that owns the call instead of starting a
+      // second webhook listener. New calls use the current registration selector below.
       const liveSlot = runtimeCoordinator.slot;
       if (liveSlot && liveSlot.state === "running") {
+        activateRuntimeGeneration(runtimeRegistration.generation);
         return liveSlot.runtime;
       }
-      return ensureRuntime();
+      return await ensureRuntime();
     };
-    const commands = createVoiceCallCommandService(ensureRuntimeForCommands);
+    const ensureRuntimeForNewCall = async () => {
+      return await ensureRuntime();
+    };
+    const commands = createVoiceCallCommandService({
+      ensureRuntimeForExistingCall,
+      ensureRuntimeForNewCall,
+      assertCurrentRegistration: assertCurrentRuntimeRegistration,
+    });
     const registerGatewayCommand = (
       method: string,
       handler: (options: GatewayRequestHandlerOptions) => unknown,

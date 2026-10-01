@@ -4,6 +4,7 @@ import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi } from "./api.js";
 import type { VoiceCallRuntime } from "./runtime-entry.js";
+import type { CallRecord } from "./src/types.js";
 
 vi.mock("./runtime-entry.js", () => ({
   createVoiceCallRuntime: vi.fn(),
@@ -26,6 +27,8 @@ type VoiceCallToolResult = {
 type RuntimeFixture = {
   initiateCall: ReturnType<typeof vi.fn>;
   runtime: VoiceCallRuntime;
+  sendDtmf: ReturnType<typeof vi.fn>;
+  speak: ReturnType<typeof vi.fn>;
   stop: ReturnType<typeof vi.fn>;
 };
 
@@ -49,15 +52,32 @@ function createLogger(onError?: (message: string) => void) {
   };
 }
 
-function createRuntime(callId: string, toNumber: string, stopImpl?: () => Promise<void>) {
+function createRuntime(
+  callId: string,
+  toNumber: string,
+  stopImpl?: () => Promise<void>,
+  provider = "mock",
+) {
   const initiateCall = vi.fn(async () => ({ callId, success: true }));
+  const sendDtmf = vi.fn(async () => ({ success: true }));
+  const speak = vi.fn(async () => ({ success: true }));
   const stop = vi.fn(stopImpl ?? (async () => {}));
   const runtime = {
-    config: { toNumber, realtime: { enabled: false } },
-    manager: { initiateCall },
+    config: { provider, toNumber, realtime: { enabled: false } },
+    manager: {
+      initiateCall,
+      sendDtmf,
+      speak,
+      getCall: vi.fn(() => undefined),
+      getCallByProviderCallId: vi.fn(() => undefined),
+      getCallFromMemoryOrStore: vi.fn(async () => undefined),
+    },
+    webhookServer: {
+      speakRealtime: vi.fn(() => ({ success: false, error: "No active realtime bridge" })),
+    },
     stop,
   } as unknown as VoiceCallRuntime;
-  return { initiateCall, runtime, stop } satisfies RuntimeFixture;
+  return { initiateCall, runtime, sendDtmf, speak, stop } satisfies RuntimeFixture;
 }
 
 function registerVoiceCall(params: {
@@ -112,9 +132,17 @@ function executeCall(tool: VoiceCallTool): Promise<VoiceCallToolResult> {
 }
 
 async function executeGatewayCall(registration: ReturnType<typeof registerVoiceCall>) {
+  return await executeGatewayCommand(registration, "voicecall.initiate", { message: "hello" });
+}
+
+async function executeGatewayCommand(
+  registration: ReturnType<typeof registerVoiceCall>,
+  method: string,
+  params: Record<string, unknown>,
+) {
   const respond = vi.fn();
-  await registration.gatewayHandlers.get("voicecall.initiate")?.({
-    params: { message: "hello" },
+  await registration.gatewayHandlers.get(method)?.({
+    params,
     respond,
   } as never);
   return respond;
@@ -221,6 +249,100 @@ describe("voice-call runtime lifecycle", () => {
     // The predecessor's runtime manager must not have received a second call attempt.
     expect(runtimeA.initiateCall).toHaveBeenCalledTimes(1);
     expect(createVoiceCallRuntime).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects superseded retained handlers before call I/O and after an awaited lookup", async () => {
+    const historicalLookupEntered = createDeferred<void>();
+    const historicalCallReady = createDeferred<CallRecord | undefined>();
+    const runtimeA = createRuntime("call-a", "+15550000001");
+    runtimeA.runtime.manager.getCallFromMemoryOrStore = vi.fn(() => {
+      historicalLookupEntered.resolve();
+      return historicalCallReady.promise;
+    });
+    vi.mocked(createVoiceCallRuntime).mockResolvedValue(runtimeA.runtime);
+    const generationA = registerVoiceCall({ registrationMode: "full" });
+    await executeCall(generationA.tool());
+
+    const speakingA = executeGatewayCommand(generationA, "voicecall.speak", {
+      callId: "call-a",
+      message: "hello",
+    });
+    await historicalLookupEntered.promise;
+    const generationB = registerVoiceCall({ registrationMode: "full" });
+    const respondB = await executeGatewayCommand(generationB, "voicecall.dtmf", {
+      callId: "call-a",
+      digits: "1",
+    });
+
+    expect(respondB).toHaveBeenCalledWith(true, { success: true });
+    expect(runtimeA.sendDtmf).toHaveBeenCalledTimes(1);
+
+    const staleRespond = await executeGatewayCommand(generationA, "voicecall.dtmf", {
+      callId: "call-a",
+      digits: "2",
+    });
+    expect(staleRespond).toHaveBeenCalledWith(
+      false,
+      undefined,
+      expect.objectContaining({ message: expect.stringContaining("superseded") }),
+    );
+    expect(runtimeA.sendDtmf).toHaveBeenCalledTimes(1);
+
+    historicalCallReady.resolve({
+      callId: "call-a",
+      provider: "mock",
+      direction: "outbound",
+      state: "active",
+      from: "+15550000000",
+      to: "+15550000001",
+      startedAt: Date.UTC(2026, 8, 30, 12, 0, 0),
+      transcript: [],
+      processedEventIds: [],
+    });
+    const speakingRespond = await speakingA;
+    expect(speakingRespond).toHaveBeenCalledWith(
+      false,
+      undefined,
+      expect.objectContaining({ message: expect.stringContaining("superseded") }),
+    );
+    expect(runtimeA.speak).not.toHaveBeenCalled();
+  });
+
+  it("starts a new call with the current registration config after reload", async () => {
+    const runtimeA = createRuntime("call-a", "+15550000001");
+    const runtimeB = createRuntime("call-b", "+15550000002", undefined, "twilio");
+    vi.mocked(createVoiceCallRuntime)
+      .mockResolvedValueOnce(runtimeA.runtime)
+      .mockResolvedValueOnce(runtimeB.runtime);
+    const generationA = registerVoiceCall({
+      config: { provider: "mock", toNumber: "+15550000001" },
+      registrationMode: "full",
+    });
+    await executeCall(generationA.tool());
+    const generationB = registerVoiceCall({
+      config: {
+        provider: "twilio",
+        fromNumber: "+15550000003",
+        toNumber: "+15550000002",
+        twilio: { accountSid: "AC123", authToken: "test-token" },
+      },
+      registrationMode: "full",
+    });
+
+    const respond = await executeGatewayCall(generationB);
+
+    expect(respond).toHaveBeenCalledWith(true, { callId: "call-b", initiated: true });
+    expect(runtimeA.stop).toHaveBeenCalledTimes(1);
+    expect(runtimeA.initiateCall).toHaveBeenCalledTimes(1);
+    expect(runtimeB.initiateCall).toHaveBeenCalledWith("+15550000002", undefined, {
+      message: "hello",
+      mode: undefined,
+      dtmfSequence: undefined,
+    });
+    expect(vi.mocked(createVoiceCallRuntime).mock.calls[1]?.[0].config).toMatchObject({
+      provider: "twilio",
+      toNumber: "+15550000002",
+    });
   });
 
   it("waits for A stopping before creating B with B config", async () => {

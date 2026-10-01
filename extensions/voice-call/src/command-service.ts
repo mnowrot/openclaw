@@ -19,6 +19,12 @@ type VoiceCallStatus = Pick<
 
 export class VoiceCallCommandInputError extends Error {}
 
+type VoiceCallCommandRuntimeSelectors = {
+  ensureRuntimeForExistingCall: () => Promise<VoiceCallRuntime>;
+  ensureRuntimeForNewCall: () => Promise<VoiceCallRuntime>;
+  assertCurrentRegistration: () => void;
+};
+
 function toVoiceCallStatus(call: CallRecord): VoiceCallStatus {
   return {
     callId: call.callId,
@@ -46,9 +52,15 @@ function requireSuccess(result: { success: boolean; error?: string }, fallback: 
   }
 }
 
-export function createVoiceCallCommandService(ensureRuntime: () => Promise<VoiceCallRuntime>) {
+export function createVoiceCallCommandService({
+  ensureRuntimeForExistingCall,
+  ensureRuntimeForNewCall,
+  assertCurrentRegistration,
+}: VoiceCallCommandRuntimeSelectors) {
   const describeHistoricalCall = async (rt: VoiceCallRuntime, callId: string) => {
+    assertCurrentRegistration();
     const call = await rt.manager.getCallFromMemoryOrStore(callId);
+    assertCurrentRegistration();
     if (!call) {
       return undefined;
     }
@@ -64,7 +76,8 @@ export function createVoiceCallCommandService(ensureRuntime: () => Promise<Voice
   const resolveCallMessage = async (callId?: string, message?: string) => {
     const resolvedCallId = requireInput(callId, "callId and message required");
     const resolvedMessage = requireInput(message, "callId and message required");
-    const rt = await ensureRuntime();
+    const rt = await ensureRuntimeForExistingCall();
+    assertCurrentRegistration();
     const activeCall =
       rt.manager.getCall(resolvedCallId) ?? rt.manager.getCallByProviderCallId(resolvedCallId);
     if (!activeCall) {
@@ -80,6 +93,7 @@ export function createVoiceCallCommandService(ensureRuntime: () => Promise<Voice
     return {
       rt: request.rt,
       run: async () => {
+        assertCurrentRegistration();
         const result = await request.rt.manager.continueCall(request.callId, request.message);
         requireSuccess(result, "continue failed");
         return { success: true as const, transcript: result.transcript };
@@ -102,8 +116,9 @@ export function createVoiceCallCommandService(ensureRuntime: () => Promise<Voice
       },
       missingToMessage = "to required",
     ) {
-      const rt = await ensureRuntime();
+      const rt = await ensureRuntimeForNewCall();
       const to = requireInput(params.to ?? rt.config.toNumber, missingToMessage);
+      assertCurrentRegistration();
       const result = await rt.manager.initiateCall(to, params.sessionKey, {
         message: params.message,
         mode: params.mode,
@@ -121,6 +136,7 @@ export function createVoiceCallCommandService(ensureRuntime: () => Promise<Voice
 
     async speak(params: { callId?: string; message?: string; allowTwimlFallback?: boolean }) {
       const request = await resolveCallMessage(params.callId, params.message);
+      assertCurrentRegistration();
       if (request.rt.config.realtime.enabled) {
         const realtimeResult = request.rt.webhookServer.speakRealtime(
           request.callId,
@@ -144,7 +160,8 @@ export function createVoiceCallCommandService(ensureRuntime: () => Promise<Voice
     async sendDtmf(callId?: string, digits?: string) {
       const resolvedCallId = requireInput(callId, "callId and digits required");
       const resolvedDigits = requireInput(digits, "callId and digits required");
-      const rt = await ensureRuntime();
+      const rt = await ensureRuntimeForExistingCall();
+      assertCurrentRegistration();
       const result = await rt.manager.sendDtmf(resolvedCallId, resolvedDigits);
       requireSuccess(result, "dtmf failed");
       return { success: true };
@@ -152,18 +169,24 @@ export function createVoiceCallCommandService(ensureRuntime: () => Promise<Voice
 
     async endCall(callId?: string) {
       const resolvedCallId = requireInput(callId, "callId required");
-      const rt = await ensureRuntime();
+      const rt = await ensureRuntimeForExistingCall();
+      assertCurrentRegistration();
       const result = await rt.manager.endCall(resolvedCallId);
       requireSuccess(result, "end failed");
       return { success: true };
     },
 
     async status(callId?: string) {
-      const rt = await ensureRuntime();
+      const rt = await ensureRuntimeForExistingCall();
+      assertCurrentRegistration();
       if (!callId) {
-        return { found: true, calls: rt.manager.getActiveCalls().map(toVoiceCallStatus) };
+        return {
+          found: true,
+          calls: rt.manager.getActiveCalls().map(toVoiceCallStatus),
+        };
       }
       const call = await rt.manager.getCallFromMemoryOrStore(callId);
+      assertCurrentRegistration();
       return call ? { found: true, call: toVoiceCallStatus(call) } : { found: false };
     },
   };
