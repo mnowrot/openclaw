@@ -583,7 +583,9 @@ describe("voice-call plugin", () => {
 
     await handler?.({ params: { callId: "CA123", message: "hello" }, respond });
 
-    expect(runtimeStub.manager["speak"]).toHaveBeenCalledWith("call-1", "hello");
+    expect(runtimeStub.manager["speak"]).toHaveBeenCalledWith("call-1", "hello", {
+      isCurrent: expect.any(Function),
+    });
     expect(firstRespondCall(respond)).toEqual([true, { success: true }]);
   });
 
@@ -643,7 +645,9 @@ describe("voice-call plugin", () => {
     })) as { details: { success?: boolean } };
 
     expect(runtimeStub.webhookServer["speakRealtime"]).toHaveBeenCalledWith("call-1", "hello");
-    expect(runtimeStub.manager["speak"]).toHaveBeenCalledWith("call-1", "hello");
+    expect(runtimeStub.manager["speak"]).toHaveBeenCalledWith("call-1", "hello", {
+      isCurrent: expect.any(Function),
+    });
     expect(result.details.success).toBe(true);
   });
 
@@ -998,7 +1002,9 @@ describe("voice-call plugin", () => {
     );
     expect(startPayload?.status).toBe("pending");
     expect(startPayload?.pollTimeoutMs).toBe(180000);
-    expect(runtimeStub.manager["continueCall"]).toHaveBeenCalledWith("call-1", "Hello");
+    expect(runtimeStub.manager["continueCall"]).toHaveBeenCalledWith("call-1", "Hello", {
+      isCurrent: expect.any(Function),
+    });
 
     const pendingRespond = vi.fn();
     await result?.({

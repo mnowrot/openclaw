@@ -1,5 +1,6 @@
 import os from "node:os";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
 import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi } from "./api.js";
@@ -12,6 +13,7 @@ vi.mock("./runtime-entry.js", () => ({
 
 import plugin from "./index.js";
 import { createVoiceCallRuntime } from "./runtime-entry.js";
+import { speak as speakWithContext } from "./src/manager/outbound.js";
 
 type VoiceCallService = Parameters<OpenClawPluginApi["registerService"]>[0];
 type VoiceCallGatewayHandler = Parameters<OpenClawPluginApi["registerGatewayMethod"]>[1];
@@ -306,6 +308,81 @@ describe("voice-call runtime lifecycle", () => {
       expect.objectContaining({ message: expect.stringContaining("superseded") }),
     );
     expect(runtimeA.speak).not.toHaveBeenCalled();
+  });
+
+  it("fences borrowed-runtime playback when registration changes during the state write", async () => {
+    const stateWriteEntered = createDeferred<void>();
+    const releaseStateWrite = createDeferred<void>();
+    const playTts = vi.fn(async () => {});
+    let blockNextStoreWrite = true;
+    const stateStore = {
+      register: vi.fn(async () => {
+        if (blockNextStoreWrite) {
+          blockNextStoreWrite = false;
+          stateWriteEntered.resolve();
+          await releaseStateWrite.promise;
+        }
+      }),
+      count: vi.fn(async () => 0),
+    };
+    const call: CallRecord = {
+      callId: "call-a",
+      providerCallId: "provider-a",
+      provider: "mock",
+      direction: "outbound",
+      state: "active",
+      from: "+15550000000",
+      to: "+15550000001",
+      startedAt: Date.UTC(2026, 8, 30, 12, 0, 0),
+      transcript: [],
+      processedEventIds: [],
+    };
+    const managerContext = {
+      mutationQueue: new KeyedAsyncQueue(),
+      activeCalls: new Map([[call.callId, call]]),
+      providerCallIdMap: new Map([["provider-a", call.callId]]),
+      provider: { name: "mock", playTts },
+      config: { tts: { provider: "openai" } },
+      storePath: "/tmp/voice-call-lifecycle-test",
+      stateRuntime: { openKeyedStore: vi.fn(() => stateStore) },
+      transcriptWaiters: new Map(),
+      maxDurationTimers: new Map(),
+      endCallOperations: new Map(),
+      trackCallWork: vi.fn(),
+      isStopping: () => false,
+    };
+    const runtimeA = createRuntime("call-a", "+15550000001");
+    runtimeA.runtime.manager.getCall = vi.fn(() => call);
+    runtimeA.runtime.manager.speak = vi.fn((callId, message, options) =>
+      speakWithContext(managerContext as never, callId, message, options),
+    );
+    vi.mocked(createVoiceCallRuntime).mockResolvedValue(runtimeA.runtime);
+    const generationA = registerVoiceCall({ registrationMode: "full" });
+    await executeCall(generationA.tool());
+
+    const generationB = registerVoiceCall({ registrationMode: "full" });
+    const speakingB = executeGatewayCommand(generationB, "voicecall.speak", {
+      callId: call.callId,
+      message: "hello",
+    });
+    await stateWriteEntered.promise;
+
+    const generationC = registerVoiceCall({ registrationMode: "full" });
+    const respondC = await executeGatewayCommand(generationC, "voicecall.dtmf", {
+      callId: call.callId,
+      digits: "1",
+    });
+    expect(respondC).toHaveBeenCalledWith(true, { success: true });
+
+    releaseStateWrite.resolve();
+    const respondB = await speakingB;
+
+    expect(playTts).not.toHaveBeenCalled();
+    expect(respondB).toHaveBeenCalledWith(
+      false,
+      undefined,
+      expect.objectContaining({ message: expect.stringContaining("superseded") }),
+    );
   });
 
   it("starts a new call with the current registration config after reload", async () => {

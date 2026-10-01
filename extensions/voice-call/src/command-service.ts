@@ -57,6 +57,15 @@ export function createVoiceCallCommandService({
   ensureRuntimeForNewCall,
   assertCurrentRegistration,
 }: VoiceCallCommandRuntimeSelectors) {
+  const isCurrentRegistration = (): boolean => {
+    try {
+      assertCurrentRegistration();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   const describeHistoricalCall = async (rt: VoiceCallRuntime, callId: string) => {
     assertCurrentRegistration();
     const call = await rt.manager.getCallFromMemoryOrStore(callId);
@@ -94,7 +103,9 @@ export function createVoiceCallCommandService({
       rt: request.rt,
       run: async () => {
         assertCurrentRegistration();
-        const result = await request.rt.manager.continueCall(request.callId, request.message);
+        const result = await request.rt.manager.continueCall(request.callId, request.message, {
+          isCurrent: isCurrentRegistration,
+        });
         requireSuccess(result, "continue failed");
         return { success: true as const, transcript: result.transcript };
       },
@@ -152,7 +163,9 @@ export function createVoiceCallCommandService({
           };
         }
       }
-      const result = await request.rt.manager.speak(request.callId, request.message);
+      const result = await request.rt.manager.speak(request.callId, request.message, {
+        isCurrent: isCurrentRegistration,
+      });
       requireSuccess(result, "speak failed");
       return { success: true };
     },

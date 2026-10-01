@@ -516,6 +516,7 @@ export async function continueCall(
   ctx: ConversationContext,
   callId: CallId,
   prompt: string,
+  options?: Pick<SpeakOptions, "isCurrent">,
 ): Promise<{ success: boolean; transcript?: string; error?: string }> {
   const connected = requireConnectedCall(ctx, callId);
   if (connected.kind === "error") {
@@ -532,16 +533,25 @@ export async function continueCall(
   const turnToken = provider.name === "twilio" ? crypto.randomUUID() : undefined;
 
   try {
-    const speakResult = await speak(ctx, callId, prompt);
+    const speakResult = await speak(ctx, callId, prompt, options);
     if (!speakResult.success) {
       return speakResult;
     }
 
     if (
-      !(await updateCall(ctx, call, (next) => transitionState(next, "listening"))) ||
+      !(await updateCall(
+        ctx,
+        call,
+        (next) => transitionState(next, "listening"),
+        options?.isCurrent,
+      )) ||
+      options?.isCurrent?.() === false ||
       !isCurrentCall(ctx, call)
     ) {
-      return { success: false, error: "Call has ended" };
+      return {
+        success: false,
+        error: options?.isCurrent?.() === false ? "Call command superseded" : "Call has ended",
+      };
     }
 
     if (ctx.isStopping()) {
@@ -559,29 +569,43 @@ export async function continueCall(
     if (!isCurrentCall(ctx, call)) {
       return { success: false, error: "Call has ended" };
     }
+    if (options?.isCurrent?.() === false) {
+      return { success: false, error: "Call command superseded" };
+    }
 
     const transcript = await waitForFinalTranscript(ctx, callId, turnToken);
     const transcriptReceivedAt = Date.now();
 
+    if (options?.isCurrent?.() === false) {
+      return { success: false, error: "Call command superseded" };
+    }
     // Best-effort: stop listening after final transcript.
     await provider.stopListening({ callId, providerCallId });
 
     const lastTurnLatencyMs = transcriptReceivedAt - turnStartedAt;
     const lastTurnListenWaitMs = transcriptReceivedAt - listenStartedAt;
     if (
-      !(await updateCall(ctx, call, (next) => {
-        const turnCount =
-          typeof next.metadata?.turnCount === "number" ? next.metadata.turnCount + 1 : 1;
-        next.metadata = {
-          ...next.metadata,
-          turnCount,
-          lastTurnLatencyMs,
-          lastTurnListenWaitMs,
-          lastTurnCompletedAt: transcriptReceivedAt,
-        };
-      }))
+      !(await updateCall(
+        ctx,
+        call,
+        (next) => {
+          const turnCount =
+            typeof next.metadata?.turnCount === "number" ? next.metadata.turnCount + 1 : 1;
+          next.metadata = {
+            ...next.metadata,
+            turnCount,
+            lastTurnLatencyMs,
+            lastTurnListenWaitMs,
+            lastTurnCompletedAt: transcriptReceivedAt,
+          };
+        },
+        options?.isCurrent,
+      ))
     ) {
-      return { success: false, error: "Call has ended" };
+      return {
+        success: false,
+        error: options?.isCurrent?.() === false ? "Call command superseded" : "Call has ended",
+      };
     }
 
     console.log(

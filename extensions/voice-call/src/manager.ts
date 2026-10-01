@@ -471,8 +471,11 @@ export class CallManager {
   async continueCall(
     callId: CallId,
     prompt: string,
+    options?: Pick<SpeakOptions, "isCurrent">,
   ): Promise<{ success: boolean; transcript?: string; error?: string }> {
-    return this.runOperation(() => continueCallWithContext(this.getContext(), callId, prompt));
+    return this.runOperation(() =>
+      continueCallWithContext(this.getContext(), callId, prompt, options),
+    );
   }
 
   /**
