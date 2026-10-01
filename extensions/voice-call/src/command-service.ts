@@ -130,13 +130,20 @@ export function createVoiceCallCommandService({
       const rt = await ensureRuntimeForNewCall();
       const to = requireInput(params.to ?? rt.config.toNumber, missingToMessage);
       assertCurrentRegistration();
-      const result = await rt.manager.initiateCall(to, params.sessionKey, {
-        message: params.message,
-        mode: params.mode,
-        dtmfSequence: params.dtmfSequence,
-        ...(params.requesterSessionKey ? { requesterSessionKey: params.requesterSessionKey } : {}),
-        ...(params.agentId ? { agentId: params.agentId } : {}),
-      });
+      const result = await rt.manager.initiateCall(
+        to,
+        params.sessionKey,
+        {
+          message: params.message,
+          mode: params.mode,
+          dtmfSequence: params.dtmfSequence,
+          ...(params.requesterSessionKey
+            ? { requesterSessionKey: params.requesterSessionKey }
+            : {}),
+          ...(params.agentId ? { agentId: params.agentId } : {}),
+        },
+        { isCurrent: isCurrentRegistration },
+      );
       requireSuccess(result, "initiate failed");
       return { callId: result.callId, initiated: true };
     },

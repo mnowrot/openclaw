@@ -86,6 +86,10 @@ type ConnectedCallLookup =
       provider: NonNullable<ConnectedCallContext["provider"]>;
     };
 
+export type InitiateCallAdmission = {
+  isCurrent?: () => boolean;
+};
+
 function lookupConnectedCall(ctx: ConnectedCallContext, callId: CallId): ConnectedCallLookup {
   const call = ctx.activeCalls.get(callId);
   if (!call) {
@@ -123,6 +127,7 @@ export async function initiateCall(
   to: string,
   sessionKey?: string,
   options?: OutboundCallOptions | string,
+  admission?: InitiateCallAdmission,
 ): Promise<{ callId: CallId; success: boolean; error?: string }> {
   const opts: OutboundCallOptions =
     typeof options === "string" ? { message: options } : (options ?? {});
@@ -203,6 +208,21 @@ export async function initiateCall(
     ctx.pendingCallAdmissions.delete(callId);
   }
 
+  const rejectSupersededAdmission = async () => {
+    ctx.pendingCallAdmissions.delete(callId);
+    await ctx.mutationQueue.enqueue("state", () =>
+      finalizeCall({
+        ctx,
+        call: callRecord,
+        endReason: "failed",
+      }),
+    );
+    return { callId: "", success: false, error: "Call command superseded" } as const;
+  };
+  if (admission?.isCurrent?.() === false) {
+    return await rejectSupersededAdmission();
+  }
+
   try {
     if (ctx.isStopping()) {
       throw new Error("Voice Call manager is stopping");
@@ -221,6 +241,9 @@ export async function initiateCall(
       );
     }
 
+    if (admission?.isCurrent?.() === false) {
+      return await rejectSupersededAdmission();
+    }
     const streamSession =
       ctx.config.realtime?.enabled && ctx.provider.name === "telnyx" && ctx.streamSessionIssuer
         ? ctx.streamSessionIssuer({
@@ -232,6 +255,9 @@ export async function initiateCall(
           })
         : undefined;
 
+    if (admission?.isCurrent?.() === false) {
+      return await rejectSupersededAdmission();
+    }
     const result = await ctx.provider.initiateCall({
       callId,
       from,

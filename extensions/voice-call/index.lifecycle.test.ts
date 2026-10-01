@@ -1,10 +1,17 @@
 import os from "node:os";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
+import type {
+  OpenAsyncKeyedStoreOptions,
+  PluginStateKeyedStore,
+} from "openclaw/plugin-sdk/plugin-state-runtime";
 import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
+import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi } from "./api.js";
 import type { VoiceCallRuntime } from "./runtime-entry.js";
+import { VoiceCallConfigSchema } from "./src/config.js";
+import { CallManager } from "./src/manager.js";
 import type { CallRecord } from "./src/types.js";
 
 vi.mock("./runtime-entry.js", () => ({
@@ -13,7 +20,14 @@ vi.mock("./runtime-entry.js", () => ({
 
 import plugin from "./index.js";
 import { createVoiceCallRuntime } from "./runtime-entry.js";
+import {
+  createVoiceCallStateRuntimeForTests,
+  FakeProvider,
+  registerTestManagerCleanup,
+} from "./src/manager.test-harness.js";
 import { speak as speakWithContext } from "./src/manager/outbound.js";
+import { CALL_RECORD_EVENTS_NAMESPACE } from "./src/manager/store.js";
+import type { VoiceCallStateRuntime } from "./src/runtime-state.js";
 
 type VoiceCallService = Parameters<OpenClawPluginApi["registerService"]>[0];
 type VoiceCallGatewayHandler = Parameters<OpenClawPluginApi["registerGatewayMethod"]>[1];
@@ -44,6 +58,7 @@ const serviceContext = {
   logger: { info() {}, warn() {}, error() {}, debug() {} },
   serviceHealth,
 } as Parameters<VoiceCallService["start"]>[0];
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 function createLogger(onError?: (message: string) => void) {
   return {
@@ -385,6 +400,119 @@ describe("voice-call runtime lifecycle", () => {
     );
   });
 
+  it("fences borrowed-runtime dialing when registration changes during admission", async () => {
+    const stateWriteEntered = createDeferred<void>();
+    const releaseStateWrite = createDeferred<void>();
+    const stateStores = new Map<string, Map<string, { value: unknown; createdAt: number }>>();
+    let blockNextAdmissionWrite = false;
+    const stateRuntime: VoiceCallStateRuntime["state"] = {
+      ...createVoiceCallStateRuntimeForTests(),
+      openKeyedStore: <T>(options: OpenAsyncKeyedStoreOptions): PluginStateKeyedStore<T> => {
+        const records =
+          stateStores.get(options.namespace) ??
+          new Map<string, { value: unknown; createdAt: number }>();
+        stateStores.set(options.namespace, records);
+        return {
+          async register(key: string, value: T) {
+            if (options.namespace === CALL_RECORD_EVENTS_NAMESPACE && blockNextAdmissionWrite) {
+              blockNextAdmissionWrite = false;
+              stateWriteEntered.resolve();
+              await releaseStateWrite.promise;
+            }
+            records.set(key, { value, createdAt: Date.now() });
+          },
+          async lookup(key: string) {
+            return records.get(key)?.value as T | undefined;
+          },
+          async registerIfAbsent(key: string, value: T) {
+            if (records.has(key)) {
+              return false;
+            }
+            records.set(key, { value, createdAt: Date.now() });
+            return true;
+          },
+          async consume(key: string) {
+            const value = records.get(key)?.value as T | undefined;
+            records.delete(key);
+            return value;
+          },
+          async delete(key: string) {
+            return records.delete(key);
+          },
+          async entries() {
+            return [...records].map(([key, entry]) => ({
+              key,
+              value: entry.value as T,
+              createdAt: entry.createdAt,
+            }));
+          },
+          async count() {
+            return records.size;
+          },
+          async clear() {
+            records.clear();
+          },
+        };
+      },
+    };
+    const provider = Object.assign(new FakeProvider(), {
+      sendDtmf: vi.fn(async () => {}),
+    });
+    const dial = vi
+      .spyOn(provider, "initiateCall")
+      .mockImplementation(async (input) => ({ providerCallId: `provider-${input.callId}` }));
+    const config = VoiceCallConfigSchema.parse({
+      provider: "plivo",
+      fromNumber: "+15550000000",
+      maxConcurrentCalls: 2,
+    });
+    const manager = registerTestManagerCleanup(
+      new CallManager(
+        config,
+        tempDirs.make("openclaw-voice-call-lifecycle-"),
+        undefined,
+        stateRuntime,
+      ),
+    );
+    await manager.initialize(provider, "https://example.com/voice/webhook");
+    const liveCall = await manager.initiateCall("+15550000001");
+    expect(liveCall.success).toBe(true);
+
+    const runtime = createRuntime("unused", "+15550000002");
+    runtime.runtime.manager = manager;
+    vi.mocked(createVoiceCallRuntime).mockResolvedValue(runtime.runtime);
+    const generationB = registerVoiceCall({ registrationMode: "full" });
+    blockNextAdmissionWrite = true;
+    const dialingB = executeGatewayCommand(generationB, "voicecall.initiate", {
+      to: "+15550000002",
+      message: "hello",
+    });
+    await stateWriteEntered.promise;
+
+    const generationC = registerVoiceCall({ registrationMode: "full" });
+    const respondC = await executeGatewayCommand(generationC, "voicecall.dtmf", {
+      callId: liveCall.callId,
+      digits: "1",
+    });
+    expect(respondC).toHaveBeenCalledWith(true, { success: true });
+
+    releaseStateWrite.resolve();
+    const respondB = await dialingB;
+
+    expect(dial).toHaveBeenCalledTimes(1);
+    expect(dial).not.toHaveBeenCalledWith(expect.objectContaining({ to: "+15550000002" }));
+    expect(respondB).toHaveBeenCalledWith(
+      false,
+      undefined,
+      expect.objectContaining({ message: expect.stringContaining("superseded") }),
+    );
+    expect(manager.getActiveCalls().map((call) => call.callId)).toEqual([liveCall.callId]);
+    const rejectedRecords = (await manager.getCallHistory()).filter(
+      (call) => call.callId !== liveCall.callId,
+    );
+    expect(rejectedRecords.at(-1)).toMatchObject({ state: "failed", endReason: "failed" });
+  });
+
   it("starts a new call with the current registration config after reload", async () => {
     const runtimeA = createRuntime("call-a", "+15550000001");
     const runtimeB = createRuntime("call-b", "+15550000002", undefined, "twilio");
@@ -411,11 +539,16 @@ describe("voice-call runtime lifecycle", () => {
     expect(respond).toHaveBeenCalledWith(true, { callId: "call-b", initiated: true });
     expect(runtimeA.stop).toHaveBeenCalledTimes(1);
     expect(runtimeA.initiateCall).toHaveBeenCalledTimes(1);
-    expect(runtimeB.initiateCall).toHaveBeenCalledWith("+15550000002", undefined, {
-      message: "hello",
-      mode: undefined,
-      dtmfSequence: undefined,
-    });
+    expect(runtimeB.initiateCall).toHaveBeenCalledWith(
+      "+15550000002",
+      undefined,
+      {
+        message: "hello",
+        mode: undefined,
+        dtmfSequence: undefined,
+      },
+      { isCurrent: expect.any(Function) },
+    );
     expect(vi.mocked(createVoiceCallRuntime).mock.calls[1]?.[0].config).toMatchObject({
       provider: "twilio",
       toNumber: "+15550000002",

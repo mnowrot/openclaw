@@ -13,6 +13,7 @@ import {
   sendDtmf as sendDtmfWithContext,
   speak as speakWithContext,
   speakInitialMessage as speakInitialMessageWithContext,
+  type InitiateCallAdmission,
   type SpeakOptions,
 } from "./manager/outbound.js";
 import {
@@ -432,9 +433,10 @@ export class CallManager {
     to: string,
     sessionKey?: string,
     options?: OutboundCallOptions | string,
+    admission?: InitiateCallAdmission,
   ): Promise<{ callId: CallId; success: boolean; error?: string }> {
     return this.runOperation(() =>
-      initiateCallWithContext(this.getContext(), to, sessionKey, options),
+      initiateCallWithContext(this.getContext(), to, sessionKey, options, admission),
     );
   }
 
