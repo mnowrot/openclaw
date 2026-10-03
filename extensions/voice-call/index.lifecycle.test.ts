@@ -458,9 +458,10 @@ describe("voice-call runtime lifecycle", () => {
     const provider = Object.assign(new FakeProvider(), {
       sendDtmf: vi.fn(async () => {}),
     });
-    const dial = vi
-      .spyOn(provider, "initiateCall")
-      .mockImplementation(async (input) => ({ providerCallId: `provider-${input.callId}` }));
+    const dial = vi.spyOn(provider, "initiateCall").mockImplementation(async (input) => ({
+      providerCallId: `provider-${input.callId}`,
+      status: "initiated",
+    }));
     const config = VoiceCallConfigSchema.parse({
       provider: "plivo",
       fromNumber: "+15550000000",
