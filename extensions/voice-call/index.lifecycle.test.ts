@@ -1,11 +1,15 @@
 import os from "node:os";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
+import type { OpenClawPluginServiceContextV2 } from "openclaw/plugin-sdk/plugin-entry";
 import type {
   OpenAsyncKeyedStoreOptions,
   PluginStateKeyedStore,
 } from "openclaw/plugin-sdk/plugin-state-runtime";
-import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
+import {
+  createTestPluginApi,
+  createTestPluginServiceScheduler,
+} from "openclaw/plugin-sdk/plugin-test-api";
 import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi } from "./api.js";
@@ -57,7 +61,8 @@ const serviceContext = {
   stateDir: os.tmpdir(),
   logger: { info() {}, warn() {}, error() {}, debug() {} },
   serviceHealth,
-} as Parameters<VoiceCallService["start"]>[0];
+  scheduler: createTestPluginServiceScheduler(),
+} satisfies OpenClawPluginServiceContextV2;
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 function createLogger(onError?: (message: string) => void) {
@@ -568,10 +573,12 @@ describe("voice-call runtime lifecycle", () => {
       .mockResolvedValueOnce(runtimeA.runtime)
       .mockResolvedValueOnce(runtimeB.runtime);
     const generationA = registerVoiceCall({ config: { toNumber: "+15550000001" } });
+    expect(generationA.service.start(serviceContext)).toBeUndefined();
     await executeCall(generationA.tool());
     const generationB = registerVoiceCall({ config: { toNumber: "+15550000002" } });
 
     const stoppingA = generationA.service.stop?.(serviceContext);
+    expect(generationB.service.start(serviceContext)).toBeUndefined();
     const callB = executeCall(generationB.tool());
     await aStopEntered.promise;
     expect(runtimeA.stop).toHaveBeenCalledTimes(1);
@@ -593,6 +600,7 @@ describe("voice-call runtime lifecycle", () => {
     const generationA = registerVoiceCall({ config: { toNumber: "+15550000001" } });
     const generationB = registerVoiceCall({ config: { toNumber: "+15550000002" } });
 
+    expect(generationB.service.start(serviceContext)).toBeUndefined();
     await executeCall(generationB.tool());
     await generationA.service.stop?.(serviceContext);
     await executeCall(generationB.tool());
@@ -610,6 +618,7 @@ describe("voice-call runtime lifecycle", () => {
       .mockResolvedValueOnce(runtimeB.runtime);
     const generationA = registerVoiceCall({ registrationMode: "full" });
     const concreteToolA = generationA.tool();
+    expect(generationA.service.start(serviceContext)).toBeUndefined();
     await executeCall(concreteToolA);
     const coldRegistryA = registerVoiceCall({ registrationMode: "tool-discovery" });
     const coldToolA = coldRegistryA.toolFactory({});
@@ -646,6 +655,7 @@ describe("voice-call runtime lifecycle", () => {
     const retainedToolA = stagedA.tool();
     const generationB = registerVoiceCall({ registrationMode: "full" });
 
+    expect(generationB.service.start(serviceContext)).toBeUndefined();
     await executeCall(generationB.tool());
     await generationB.service.stop?.(serviceContext);
     expectLifecycleError(await executeCall(retainedToolA), "superseded");
@@ -666,6 +676,7 @@ describe("voice-call runtime lifecycle", () => {
       .mockResolvedValueOnce(runtimeA.runtime)
       .mockResolvedValueOnce(runtimeB.runtime);
     const generationA = registerVoiceCall({});
+    expect(generationA.service.start(serviceContext)).toBeUndefined();
     await executeCall(generationA.tool());
     const generationB = registerVoiceCall({});
 

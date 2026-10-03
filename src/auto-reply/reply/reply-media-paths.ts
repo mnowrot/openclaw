@@ -1,4 +1,3 @@
-// Resolves media paths from reply payloads into runtime attachment metadata.
 import path from "node:path";
 import { sanitizeUntrustedFileName } from "@openclaw/fs-safe/advanced";
 import { mediaKindFromMime } from "@openclaw/media-core/constants";
@@ -64,11 +63,6 @@ function resolveReplyMediaFailureLabel(media: string, index: number): string {
   );
 }
 
-function resolveReplyMediaFailureKind(media: string): ReplyMediaFailure["kind"] {
-  const kind = mediaKindFromMime(mimeTypeFromFilePath(media));
-  return kind === "image" || kind === "audio" || kind === "video" ? kind : "document";
-}
-
 function resolveReplyMediaFailureCode(error: unknown): ReplyMediaFailure["code"] {
   let current: unknown = error;
   // Media loaders wrap filesystem/policy errors; bound cause traversal so malformed cycles fail safe.
@@ -92,9 +86,10 @@ function resolveReplyMediaFailureCode(error: unknown): ReplyMediaFailure["code"]
 
 function createReplyMediaFailure(media: string, index: number, error: unknown): ReplyMediaFailure {
   const mimeType = mimeTypeFromFilePath(media);
+  const kind = mediaKindFromMime(mimeType);
   return {
     code: resolveReplyMediaFailureCode(error),
-    kind: resolveReplyMediaFailureKind(media),
+    kind: kind === "image" || kind === "audio" || kind === "video" ? kind : "document",
     label: resolveReplyMediaFailureLabel(media, index),
     ...(mimeType ? { mimeType } : {}),
   };
@@ -205,33 +200,6 @@ export function createReplyMediaSourcePreparer(params: {
     return await sandboxWorkspacePromise;
   };
 
-  const resolveMediaAccessForSource = (
-    media: string,
-    sessionWorkspaceDir?: string,
-    workspaceDir?: string,
-  ) =>
-    resolveAgentScopedOutboundMediaAccess({
-      cfg: params.cfg,
-      agentId,
-      workspaceDir: workspaceDir ?? params.workspaceDir,
-      sessionWorkspaceDir: sessionWorkspaceDir ?? params.sessionWorkspaceDir,
-      workspaceOnly: params.workspaceOnly,
-      allowHostWorkspace: params.allowHostWorkspace,
-      mediaSources: [media],
-      mediaAccess: params.mediaAccess,
-      workspaceMediaAccess: params.workspaceMediaAccess,
-      sessionKey: params.sessionKey,
-      messageProvider: params.sessionKey ? undefined : params.messageProvider,
-      accountId: params.accountId,
-      requesterSenderId: params.requesterSenderId,
-      requesterSenderName: params.requesterSenderName,
-      requesterSenderUsername: params.requesterSenderUsername,
-      requesterSenderE164: params.requesterSenderE164,
-      groupId: params.groupId,
-      groupChannel: params.groupChannel,
-      groupSpace: params.groupSpace,
-    });
-
   const persistLocalReplyMedia = async (
     media: string,
     sessionWorkspaceDir?: string,
@@ -252,7 +220,27 @@ export function createReplyMediaSourcePreparer(params: {
       return await cached;
     }
     const persistPromise = resolveOutboundAttachmentFromUrl(media, maxBytes, {
-      mediaAccess: resolveMediaAccessForSource(media, sessionWorkspaceDir, workspaceDir),
+      mediaAccess: resolveAgentScopedOutboundMediaAccess({
+        cfg: params.cfg,
+        agentId,
+        workspaceDir: workspaceDir ?? params.workspaceDir,
+        sessionWorkspaceDir: sessionWorkspaceDir ?? params.sessionWorkspaceDir,
+        workspaceOnly: params.workspaceOnly,
+        allowHostWorkspace: params.allowHostWorkspace,
+        mediaSources: [media],
+        mediaAccess: params.mediaAccess,
+        workspaceMediaAccess: params.workspaceMediaAccess,
+        sessionKey: params.sessionKey,
+        messageProvider: params.sessionKey ? undefined : params.messageProvider,
+        accountId: params.accountId,
+        requesterSenderId: params.requesterSenderId,
+        requesterSenderName: params.requesterSenderName,
+        requesterSenderUsername: params.requesterSenderUsername,
+        requesterSenderE164: params.requesterSenderE164,
+        groupId: params.groupId,
+        groupChannel: params.groupChannel,
+        groupSpace: params.groupSpace,
+      }),
     })
       .then((saved) => ({
         ...saved,
@@ -434,8 +422,8 @@ export function applyPreparedReplyMedia(
     for (const source of previousSourceUrls?.get(sourceKey) ?? []) {
       sourceUrls.add(source);
     }
-    if (normalized.mediaUrl !== media.trim()) {
-      sourceUrls.add(media.trim());
+    if (normalized.mediaUrl !== media) {
+      sourceUrls.add(media);
     }
     if (sourceUrls.size > 0) {
       sourcesByReference.set(normalizedKey, sourceUrls);

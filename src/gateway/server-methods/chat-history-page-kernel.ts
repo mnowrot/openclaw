@@ -1,5 +1,5 @@
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
-import { readLegacyCompactionHistory } from "../../config/sessions/legacy-compaction-history.js";
+import { readLegacyCompactionMetrics } from "../../config/sessions/legacy-compaction-history.js";
 import type {
   ChatHistoryPage,
   ChatHistoryPageParams,
@@ -98,23 +98,12 @@ function resolveChatHistoryActiveLeafEntryId(
 export function enrichChatHistoryCompactionMarkers(
   messages: unknown[],
   entry: ChatHistoryPageParams["entry"],
+  metrics = readLegacyCompactionMetrics(entry),
 ): unknown[] {
-  let checkpoints: ReturnType<typeof readLegacyCompactionHistory>;
-  try {
-    checkpoints = readLegacyCompactionHistory(entry);
-  } catch {
-    // Corrupt legacy metadata cannot hide readable transcript history.
+  if (metrics.length === 0) {
     return messages;
   }
-  if (checkpoints.length === 0) {
-    return messages;
-  }
-  const checkpointByEntryId = new Map(
-    checkpoints.flatMap((checkpoint) => {
-      const entryId = checkpoint.postCompaction.entryId;
-      return entryId ? [[entryId, checkpoint] as const] : [];
-    }),
-  );
+  const checkpointByEntryId = new Map(metrics.map((metric) => [metric.entryId, metric]));
   let changed = false;
   const enriched = messages.map((message) => {
     const record = asOptionalRecord(message);
@@ -332,12 +321,14 @@ export async function readChatHistoryPageKernel(
     ...options,
   });
   const { readPage } = incrementalTail;
-  const isOffsetPage = offset !== undefined && !cliSessionId;
-  const includeActiveLeaf = !isOffsetPage || offset === 0;
+  const currentOffset = incrementalTail.windowReset ? 0 : offset;
+  const isOffsetPage = currentOffset !== undefined && !cliSessionId;
+  const includeActiveLeaf = !isOffsetPage || currentOffset === 0;
   const activeLeafEntryId = includeActiveLeaf
     ? resolveChatHistoryActiveLeafEntryId(readPage)
     : null;
   const buildTailPage = (messages: unknown[]): ChatHistoryPage => ({
+    ...(incrementalTail.windowReset ? { windowReset: true } : {}),
     ...(includeActiveLeaf ? { activeLeafEntryId } : {}),
     ...(includeActiveLeaf &&
     readPage.transcriptSource === "active" &&
@@ -349,9 +340,9 @@ export async function readChatHistoryPageKernel(
     ...(incrementalTail.projection.activity.length
       ? { activity: incrementalTail.projection.activity }
       : {}),
-    ...(isOffsetPage ? { responseOffset: offset } : {}),
+    ...(isOffsetPage ? { responseOffset: currentOffset } : {}),
     pagination: {
-      offset: offset ?? 0,
+      offset: currentOffset ?? 0,
       totalMessages: readPage.totalMessages,
       rawPageMessages: incrementalTail.rawPageMessages,
     },

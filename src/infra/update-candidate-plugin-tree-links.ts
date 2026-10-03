@@ -8,38 +8,21 @@ import {
   captureUpdateCandidatePluginCodeLink,
   type UpdateCandidatePluginCodeLink,
 } from "./update-candidate-plugin-code-links.js";
+import type {
+  UpdateCandidatePluginEntry,
+  UpdateCandidatePluginTreePlan,
+} from "./update-candidate-plugin-tree-schema.js";
 import { createRuntimePathLookup } from "./update-runtime-path-index.js";
 import { prepareRuntimeRelocations, relocateRuntimePath } from "./update-runtime-relocation.js";
 
-export type UpdateCandidatePluginTreeEntry = {
-  path: string;
-  size: number;
-  mode: number;
-  dev: string;
-  ino: string;
-} & (
-  | { kind: "directory" }
-  | { kind: "file"; birthtimeNs: string; mtimeNs: string; ctimeNs: string }
-  | { kind: "symlink"; link: string; linkType: "file" | "junction" }
-);
-
-type MaterializablePlan = {
-  privateRoot: string;
-  candidateRoot: string;
-  copies: Array<[string, string]>;
-  hostLinks: string[];
-  relocations: Array<{ sourceRoot: string; destinationRoot: string }>;
-  aliases: Array<[string, string]>;
-  moduleBindings: Array<[string, string]>;
-  edges: Array<{ source: string; target: string; real: string }>;
-};
+type MaterializablePlan = Omit<UpdateCandidatePluginTreePlan, "bytes" | "entries">;
 
 export const isUpdateCandidateHostLauncher = (file: string) =>
   path.basename(path.dirname(file)) === ".bin" &&
   ["openclaw", "openclaw.cmd", "openclaw.ps1"].includes(path.basename(file));
 
 export function assertUpdateCandidatePluginEntryStat(
-  entry: UpdateCandidatePluginTreeEntry,
+  entry: UpdateCandidatePluginEntry,
   current: BigIntStats,
 ): void {
   const sameKind =
@@ -234,14 +217,13 @@ export async function verifyUpdateCandidatePluginTree(
     ) {
       throw new Error("Copied plugin host link does not target the update");
     }
-    params.onCodeLink?.(captureUpdateCandidatePluginCodeLink(file, stat, link!));
-    return;
+  } else if (stat.isSymbolicLink()) {
+    assertUpdateCandidatePluginLinkTarget(file, path.resolve(path.dirname(file), link!), params);
   }
   // Inspect the entry before traversal, including standalone module aliases;
   // following a copied root link can otherwise accept an entirely live tree.
-  if (stat.isSymbolicLink()) {
-    assertUpdateCandidatePluginLinkTarget(file, path.resolve(path.dirname(file), link!), params);
-    params.onCodeLink?.(captureUpdateCandidatePluginCodeLink(file, stat, link!));
+  if (link !== undefined) {
+    params.onCodeLink?.(captureUpdateCandidatePluginCodeLink(file, stat, link));
     return;
   }
   if (stat.isDirectory()) {

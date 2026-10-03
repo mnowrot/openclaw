@@ -1,17 +1,23 @@
 import { describe, expect, it, vi } from "vitest";
+import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
 import { createSandboxBrowserTestHarness } from "./browser.create.test-helpers.js";
 
 describe("managed browser workspace custody", () => {
   const harness = createSandboxBrowserTestHarness();
   const { dockerMocks, registryMocks, buildConfig, ensureTestSandboxBrowser } = harness;
 
+  const browserParams = () => ({
+    scopeKey: "session:managed",
+    workspaceDir: harness.testWorkspaceDir,
+    agentWorkspaceDir: harness.testWorkspaceDir,
+    cfg: buildConfig(false),
+  });
+
   it("does not restart a browser after authority closes during container inspection", async () => {
     let current = true;
     await ensureTestSandboxBrowser({
+      ...browserParams(),
       scopeKey: "session:revoked-browser",
-      workspaceDir: harness.testWorkspaceDir,
-      agentWorkspaceDir: harness.testWorkspaceDir,
-      cfg: buildConfig(false),
       withWorkspace: async (run) => await run(),
       assertCurrent: () => {
         if (!current) {
@@ -48,10 +54,7 @@ describe("managed browser workspace custody", () => {
       }
     };
     const result = await ensureTestSandboxBrowser({
-      scopeKey: "session:managed",
-      workspaceDir: harness.testWorkspaceDir,
-      agentWorkspaceDir: harness.testWorkspaceDir,
-      cfg: buildConfig(false),
+      ...browserParams(),
       withWorkspace,
     });
     expect(result).not.toBeNull();
@@ -74,12 +77,7 @@ describe("managed browser workspace custody", () => {
       baseUrl: "http://127.0.0.1:19000",
       state: { server: null, port: 19000, resolved: params.resolved, profiles: new Map() },
     }));
-    const input = {
-      scopeKey: "session:managed",
-      workspaceDir: harness.testWorkspaceDir,
-      agentWorkspaceDir: harness.testWorkspaceDir,
-      cfg: buildConfig(false),
-    };
+    const input = browserParams();
     let firstCurrent = true;
     await ensureTestSandboxBrowser({
       ...input,
@@ -116,10 +114,7 @@ describe("managed browser workspace custody", () => {
     };
     await expect(
       ensureTestSandboxBrowser({
-        scopeKey: "session:managed",
-        workspaceDir: harness.testWorkspaceDir,
-        agentWorkspaceDir: harness.testWorkspaceDir,
-        cfg: buildConfig(false),
+        ...browserParams(),
         withWorkspace,
       }),
     ).rejects.toThrow("port mapping");
@@ -134,5 +129,29 @@ describe("managed browser workspace custody", () => {
     expect(reserveOrder).toBeLessThan(
       dockerMocks.execDocker.mock.invocationCallOrder[createIndex]!,
     );
+  });
+
+  it("awaits reservation acknowledgment before allocation and retains the allocation guard", async () => {
+    const started = createDeferred();
+    const acknowledgment = createDeferred();
+    const assertCurrent = vi.fn();
+    registryMocks.updateBrowserRegistry.mockImplementationOnce(async (_entry, guard) => {
+      expect(guard).toBe(assertCurrent);
+      started.resolve();
+      await acknowledgment.promise;
+    });
+    const operation = ensureTestSandboxBrowser({
+      ...browserParams(),
+      withWorkspace: async (run) => await run(),
+      assertCurrent,
+    });
+    try {
+      await awaitGateBeforeSettlement(started.promise, operation, "reservation was not reached");
+      expect(dockerMocks.execDocker.mock.calls.some(([args]) => args[0] === "create")).toBe(false);
+    } finally {
+      acknowledgment.resolve();
+      await operation;
+    }
+    expect(registryMocks.updateBrowserRegistry.mock.calls.at(-1)?.[1]).toBe(assertCurrent);
   });
 });

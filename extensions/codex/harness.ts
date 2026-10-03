@@ -123,6 +123,9 @@ export function createCodexAppServerAgentHarness(
     resolvePluginConfigObject(config, "codex") ??
     options.resolvePluginConfig?.() ??
     options.pluginConfig;
+  const resolveIsolatedCompletionRuntime: NonNullable<
+    AgentHarnessV2["resolveIsolatedCompletionRuntime"]
+  > = ({ authorizationOwner }) => (authorizationOwner === "host" ? "openclaw" : "self");
   const harness: AgentHarnessV2 = {
     id: harnessRuntimeId,
     label: options?.label ?? "Codex agent harness",
@@ -144,6 +147,7 @@ export function createCodexAppServerAgentHarness(
       visibleReplies: "message_tool",
     },
     authBootstrap: "harness",
+    resolveIsolatedCompletionRuntime,
     resolveSessionRuntimeOwnership: (params) => {
       const assertCurrent = () => {
         params.assertCurrent();
@@ -191,26 +195,6 @@ export function createCodexAppServerAgentHarness(
           },
         }
       : {}),
-    taskHistory: {
-      taskKinds: ["codex-native"],
-      read: async (params) => {
-        const { readCodexNativeSubagentHistory } =
-          await import("./src/app-server/native-subagent-history.js");
-        const assertCurrent = () => {
-          params.assertCurrent();
-          if (disposed) {
-            throw new Error("Agent harness is disposed");
-          }
-        };
-        return readCodexNativeSubagentHistory(
-          { ...params, assertCurrent },
-          {
-            bindingStore: options.bindingStore,
-            pluginConfig: resolveAttemptPluginConfig(params.cfg),
-          },
-        );
-      },
-    },
     authBinding: {
       fingerprint: async (params) => {
         const { fingerprintCodexAppServerAuthBinding } =
@@ -256,6 +240,18 @@ export function createCodexAppServerAgentHarness(
     },
     readModelCatalogReadiness: (params) =>
       modelCatalog?.read(params, resolveAttemptPluginConfig(params.config)),
+    acquireMcpAppRuntime: async (params) => {
+      const { acquireCodexMcpAppRuntime } =
+        await import("./src/app-server/effective-mcp-catalog.js");
+      if (disposed) {
+        return undefined;
+      }
+      params.assertCurrent();
+      return await acquireCodexMcpAppRuntime(params, {
+        bindingStore: options.bindingStore,
+        pluginConfig: resolveAttemptPluginConfig(params.config),
+      });
+    },
     loadMcpToolCatalog: async (params) => {
       const { loadCodexEffectiveMcpCatalog } =
         await import("./src/app-server/effective-mcp-catalog.js");
@@ -429,7 +425,10 @@ export function createCodexAppServerAgentHarness(
       return escalated;
     },
     runIsolatedCompletionV2: async (params) => {
-      if (params.authorization.owner === "host") {
+      if (
+        resolveIsolatedCompletionRuntime({ authorizationOwner: params.authorization.owner }) ===
+        "openclaw"
+      ) {
         const { runHostPreparedIsolatedCompletion } =
           await import("openclaw/plugin-sdk/simple-completion-runtime");
         return runHostPreparedIsolatedCompletion(params);

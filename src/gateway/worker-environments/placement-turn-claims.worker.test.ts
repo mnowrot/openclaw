@@ -10,7 +10,6 @@ import {
 } from "../../agents/session-placement-forced-terminal-settlement.js";
 import * as brokerReply from "../../infra/sqlite-worker-broker-reply.js";
 import * as operationAdmission from "../../infra/sqlite-worker-operation-admission.js";
-import { StateDatabaseCoordinatorContentionError } from "../../infra/state-database-coordinator-errors.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import {
   openOpenClawStateDatabase,
@@ -22,7 +21,9 @@ import {
   createWorkerSessionPlacementStore,
   type WorkerSessionPlacementStore,
 } from "./placement-store.js";
+import { advancePlacementFixtureToActive } from "./placement-test-fixtures.js";
 import { ActiveTurnClaimError, createPlacementTurnClaimOps } from "./placement-turn-claims.js";
+import { createWorkerSessionPlacementGate } from "./placement-worker-gate.js";
 import { executeLocalTurn } from "./worker-turn-admission.js";
 
 let database: OpenClawStateDatabase;
@@ -56,8 +57,145 @@ beforeAll(async () => {
 
 afterEach(() => vi.restoreAllMocks());
 
-it("claims and strictly releases durable turns without host SQLite or coordinator exec", async () => {
-  const queries = observeHostDataSql({ OPENCLAW_STATE_DIR: stateDir });
+async function workerClaim(name: string) {
+  const requested = input(name);
+  const active = await advancePlacementFixtureToActive(placements, database, requested, {
+    environmentId: `environment-${name}`,
+  });
+  return placements.claimTurn({
+    ...requested,
+    owner: {
+      kind: "worker",
+      environmentId: active.environmentId,
+      ownerEpoch: active.activeOwnerEpoch,
+    },
+  });
+}
+
+it("persists monotonic ACKs and their terminal fence through the gate without host SQLite", async () => {
+  const claim = await workerClaim("ack-cursors");
+  const gate = createWorkerSessionPlacementGate(placements);
+  const queries = observeHostDataSql();
+  try {
+    await gate.updateAckCursors({ claim, transcriptSeq: 4 });
+    await gate.updateAckCursors({ claim, liveSeq: 9 });
+    await gate.updateAckCursors({ claim, transcriptSeq: 3, liveSeq: 8 });
+    await gate.updateAckCursors({ claim, transcriptSeq: 4, liveSeq: 9 });
+    expect(queries.queries).toEqual([]);
+  } finally {
+    queries.restore();
+  }
+  expect(placements.get(claim.sessionId)).toMatchObject({
+    lastTranscriptAckCursor: 4,
+    lastLiveEventAckCursor: 9,
+  });
+  expect(await placements.listPendingWorkspaceResultsAsync(claim.sessionId)).toMatchObject([
+    { claimId: claim.claimId, gatewayInstanceId: placements.workspaceResultInstanceId() },
+  ]);
+  await placements.acceptWorkspaceResult(claim);
+  await gate.updateAckCursors({ claim, liveSeq: 9 });
+  expect(
+    (await placements.listPendingWorkspaceResultsAsync(claim.sessionId))[0]?.workspaceAcceptedAtMs,
+  ).toBe(1_000);
+  await placements.completeWorkspaceResultAndReleaseTurn(claim);
+  await expect(gate.updateAckCursors({ claim, liveSeq: 10 })).rejects.toThrow("stale worker turn");
+  expect(await placements.listPendingWorkspaceResultsAsync(claim.sessionId)).toEqual([]);
+  expect(placements.get(claim.sessionId)?.lastLiveEventAckCursor).toBe(9);
+});
+
+it.each(["placement", "caller"] as const)(
+  "rolls back both ACK cursor and terminal fence when %s authority is revoked before commit",
+  async (owner) => {
+    const claim = await workerClaim(`ack-revoked-${owner}`);
+    const gate = createWorkerSessionPlacementGate(placements);
+    let revoked = false;
+    const createAdmission = operationAdmission.createSqliteWorkerOperationAdmission;
+    vi.spyOn(operationAdmission, "createSqliteWorkerOperationAdmission").mockImplementationOnce(
+      (admit, attachment) =>
+        createAdmission((request, grant) => {
+          if (request.stage === "commit") {
+            revoked = true;
+            if (owner === "placement") {
+              gate.fenceWorkerTurnForRecovery(claim);
+            }
+          }
+          admit(request, grant);
+        }, attachment),
+    );
+    await expect(
+      gate.updateAckCursors({
+        claim,
+        liveSeq: 1,
+        assertCurrent: () => {
+          if (owner === "caller" && revoked) {
+            throw new Error("ACK caller revoked");
+          }
+        },
+      }),
+    ).rejects.toThrow(owner === "placement" ? "stale worker turn" : "ACK caller revoked");
+    expect(revoked).toBe(true);
+    expect(placements.get(claim.sessionId)?.lastLiveEventAckCursor).toBeNull();
+    expect(await placements.listPendingWorkspaceResultsAsync(claim.sessionId)).toEqual([]);
+    await placements.releaseTurn(claim);
+  },
+);
+
+it.each(["committed", "unknown"] as const)(
+  "preserves %s ACK custody after losing the worker reply",
+  async (outcome) => {
+    const claim = await workerClaim(`ack-reply-${outcome}`);
+    if (outcome === "unknown") {
+      const createAdmission = operationAdmission.createSqliteWorkerOperationAdmission;
+      vi.spyOn(operationAdmission, "createSqliteWorkerOperationAdmission").mockImplementationOnce(
+        (admit, attachment) => {
+          const admission = createAdmission(admit, attachment);
+          return {
+            ...admission,
+            get committed() {
+              return undefined;
+            },
+            get settlement() {
+              return { kind: "unknown" as const };
+            },
+          };
+        },
+      );
+    }
+    const receive = brokerReply.receiveSqliteWorkerReply;
+    let corrupted = 0;
+    vi.spyOn(brokerReply, "receiveSqliteWorkerReply").mockImplementation((slot, reply, owner) => {
+      if (slot.current?.request.type === "execute" && reply.ok && !reply.transfer && !reply.input) {
+        const value: unknown = deserialize(reply.value);
+        if (
+          isRecord(value) &&
+          isRecord(value.placement) &&
+          value.placement.sessionId === claim.sessionId
+        ) {
+          corrupted += 1;
+          return receive(slot, { ...reply, value: new Uint8Array([0]) }, owner);
+        }
+      }
+      return receive(slot, reply, owner);
+    });
+    const ack = placements.updateAckCursors({ claim, liveEvent: 1 });
+    if (outcome === "committed") {
+      await expect(ack).resolves.toMatchObject({ lastLiveEventAckCursor: 1 });
+    } else {
+      await expect(ack).rejects.toThrow();
+    }
+    expect(corrupted).toBe(1);
+    expect(placements.get(claim.sessionId)?.lastLiveEventAckCursor).toBe(1);
+    expect(await placements.listPendingWorkspaceResultsAsync(claim.sessionId)).toMatchObject([
+      { claimId: claim.claimId, gatewayInstanceId: placements.workspaceResultInstanceId() },
+    ]);
+    // Fixture recovery settles the retained fence; an unknown ACK cannot release it.
+    await placements.acceptWorkspaceResult(claim);
+    await placements.completeWorkspaceResultAndReleaseTurn(claim);
+  },
+);
+
+it("claims and strictly releases durable turns without host SQLite", async () => {
+  const queries = observeHostDataSql();
   const exec = vi.spyOn(DatabaseSync.prototype, "exec");
   try {
     const claim = await placements.claimTurn(input("sql-free"));
@@ -160,29 +298,81 @@ it("fences retained authority before release commit and closes observers after s
   }
 });
 
-it("returns committed claim custody after its real worker reply is corrupted", async () => {
-  const requested = input("lost-reply");
-  const receive = brokerReply.receiveSqliteWorkerReply;
-  let corrupted = 0;
-  vi.spyOn(brokerReply, "receiveSqliteWorkerReply").mockImplementation(
-    (slot, reply, owner, pumping) => {
+it.each(["claim", "staged result", "workspace manifest"] as const)(
+  "returns committed %s custody after its real worker reply is corrupted",
+  async (operation) => {
+    const requested = input(`lost-reply-${operation.replaceAll(" ", "-")}`);
+    const ref = `refs/openclaw/worker-results/${requested.claimId}`;
+    let stagedClaim: Awaited<ReturnType<typeof placements.claimTurn>> | undefined;
+    if (operation !== "claim") {
+      const active = await advancePlacementFixtureToActive(
+        placements,
+        database,
+        {
+          sessionId: requested.sessionId,
+          agentId: requested.agentId,
+          sessionKey: requested.sessionKey,
+          executionMode: "remote-exec",
+        },
+        { environmentId: `lost-reply-environment-${operation.replaceAll(" ", "-")}` },
+      );
+      stagedClaim = await placements.claimTurn({
+        ...requested,
+        owner: {
+          kind: "local",
+          environmentId: active.environmentId,
+          ownerEpoch: active.activeOwnerEpoch,
+        },
+      });
+      await placements.markWorkspaceResultPending(stagedClaim);
+    }
+    const receive = brokerReply.receiveSqliteWorkerReply;
+    let corrupted = 0;
+    vi.spyOn(brokerReply, "receiveSqliteWorkerReply").mockImplementation((slot, reply, owner) => {
       if (slot.current?.request.type === "execute" && reply.ok && !reply.transfer && !reply.input) {
         const value: unknown = deserialize(reply.value);
-        if (isRecord(value) && isRecord(value.claim) && value.claim.claimId === requested.claimId) {
+        const matches =
+          isRecord(value) &&
+          (operation === "claim"
+            ? isRecord(value.claim) && value.claim.claimId === requested.claimId
+            : isRecord(value.placement) && value.placement.sessionId === requested.sessionId);
+        if (matches) {
           corrupted += 1;
-          return receive(slot, { ...reply, value: new Uint8Array([0]) }, owner, pumping);
+          return receive(slot, { ...reply, value: new Uint8Array([0]) }, owner);
         }
       }
-      return receive(slot, reply, owner, pumping);
-    },
-  );
-  const claim = await placements.claimTurn(requested);
-  expect(corrupted).toBe(1);
-  expect(claim).toMatchObject({ claimId: requested.claimId, runId: requested.runId });
-  expect(placements.get(claim.sessionId)?.turnClaim).toMatchObject({ claimId: requested.claimId });
-  await placements.releaseTurn(claim);
-  expect(placements.get(claim.sessionId)?.turnClaim).toBeNull();
-});
+      return receive(slot, reply, owner);
+    });
+    if (stagedClaim) {
+      if (operation === "workspace manifest") {
+        const manifestRef = `sha256:${"a".repeat(64)}`;
+        const accepted = await placements.updateWorkspaceBaseManifest({
+          claim: stagedClaim,
+          manifestRef,
+        });
+        expect(accepted.workspaceBaseManifestRef).toBe(manifestRef);
+        expect(placements.get(requested.sessionId)?.workspaceBaseManifestRef).toBe(manifestRef);
+      } else {
+        await placements.recordStagedWorkspaceResult(stagedClaim, ref);
+        expect(
+          await placements.listPendingWorkspaceResultsAsync(requested.sessionId),
+        ).toMatchObject([{ claimId: stagedClaim.claimId, stagedResultRef: ref }]);
+      }
+      expect(corrupted).toBe(1);
+      await placements.acceptWorkspaceResult(stagedClaim);
+      await placements.completeWorkspaceResultAndReleaseTurn(stagedClaim);
+    } else {
+      const claim = await placements.claimTurn(requested);
+      expect(corrupted).toBe(1);
+      expect(claim).toMatchObject({ claimId: requested.claimId, runId: requested.runId });
+      expect(placements.get(claim.sessionId)?.turnClaim).toMatchObject({
+        claimId: requested.claimId,
+      });
+      await placements.releaseTurn(claim);
+    }
+    expect(placements.get(requested.sessionId)?.turnClaim).toBeNull();
+  },
+);
 
 it("keeps a later same-byte native claim authoritative when the old release reply arrives", async () => {
   const requested = input("late-reply");
@@ -191,29 +381,27 @@ it("keeps a later same-byte native claim authoritative when the old release repl
   const replyArrived = createDeferredCore<() => void>();
   const receive = brokerReply.receiveSqliteWorkerReply;
   let delayed = false;
-  vi.spyOn(brokerReply, "receiveSqliteWorkerReply").mockImplementation(
-    (slot, reply, owner, pumping) => {
+  vi.spyOn(brokerReply, "receiveSqliteWorkerReply").mockImplementation((slot, reply, owner) => {
+    if (
+      !delayed &&
+      slot.current?.request.type === "execute" &&
+      reply.ok &&
+      !reply.transfer &&
+      !reply.input
+    ) {
+      const value: unknown = deserialize(reply.value);
       if (
-        !delayed &&
-        slot.current?.request.type === "execute" &&
-        reply.ok &&
-        !reply.transfer &&
-        !reply.input
+        isRecord(value) &&
+        isRecord(value.placement) &&
+        value.placement.sessionId === claim.sessionId
       ) {
-        const value: unknown = deserialize(reply.value);
-        if (
-          isRecord(value) &&
-          isRecord(value.placement) &&
-          value.placement.sessionId === claim.sessionId
-        ) {
-          delayed = true;
-          replyArrived.resolve(() => receive(slot, reply, owner, pumping));
-          return;
-        }
+        delayed = true;
+        replyArrived.resolve(() => receive(slot, reply, owner));
+        return;
       }
-      return receive(slot, reply, owner, pumping);
-    },
-  );
+    }
+    return receive(slot, reply, owner);
+  });
   const releasing = placements.releaseTurn(claim);
   const deliver = await replyArrived.promise;
   let delivered = false;
@@ -261,7 +449,10 @@ it("settles a failed local startup after precommit release contention without re
       (admit, attachment) =>
         createAdmission((request, grant) => {
           if (request.stage === "transaction") {
-            throw new StateDatabaseCoordinatorContentionError("state-lifecycle");
+            throw Object.assign(new Error("database is locked"), {
+              code: "ERR_SQLITE_ERROR",
+              errcode: 5,
+            });
           }
           admit(request, grant);
         }, attachment),
@@ -282,11 +473,14 @@ it("settles a failed local startup after precommit release contention without re
   ).resolves.toBe("next turn completed");
 });
 
-it.each(["ordinary", "forced"] as const)(
-  "retains non-contention cleanup refusal across %s local completion",
-  async (completion) => {
-    const claim = input(`release-refused-${completion}`);
-    const refused = new Error("release authority refused");
+it.each(["authority", "entered writer"] as const)(
+  "retains %s cleanup refusal from forced settlement through ordinary completion",
+  async (failure) => {
+    const claim = input(`release-refused-forced-${failure}`);
+    const refused =
+      failure === "authority"
+        ? new Error("release authority refused")
+        : Object.assign(new Error("database is locked"), { code: "ERR_SQLITE_ERROR", errcode: 5 });
     const startupError = new Error("local backend startup failed");
     const createAdmission = operationAdmission.createSqliteWorkerOperationAdmission;
     const release = vi.spyOn(placements, "releaseTurnIfOwned");
@@ -296,34 +490,158 @@ it.each(["ordinary", "forced"] as const)(
       vi.spyOn(operationAdmission, "createSqliteWorkerOperationAdmission").mockImplementationOnce(
         (admit, attachment) =>
           createAdmission((request, grant) => {
-            if (request.stage === "transaction") {
+            if (request.stage === (failure === "authority" ? "transaction" : "commit")) {
               throw refused;
             }
             admit(request, grant);
           }, attachment),
       );
-      if (completion === "forced") {
-        forcedSettlement = resolveSessionPlacementForcedTerminalSettlement();
-        if (forcedSettlement) {
-          try {
-            await forcedSettlement();
-          } catch (error) {
-            forcedFailure = error;
-          }
+      forcedSettlement = resolveSessionPlacementForcedTerminalSettlement();
+      if (forcedSettlement) {
+        try {
+          await forcedSettlement();
+        } catch (error) {
+          forcedFailure = error;
         }
       }
       throw startupError;
     });
     await expect(executeLocalTurn({ claim, placements, runLocal })).rejects.toBe(refused);
-    if (completion === "forced") {
-      expect(forcedSettlement).toBeTypeOf("function");
-      expect(forcedFailure).toBe(refused);
-    }
+    expect(forcedSettlement).toBeTypeOf("function");
+    expect(forcedFailure).toBe(refused);
     expect(runLocal).toHaveBeenCalledOnce();
     expect(release).toHaveBeenCalledOnce();
     const retained = release.mock.calls[0]![0];
     expect(placements.get(claim.sessionId)?.turnClaim).toMatchObject({ claimId: retained.claimId });
     // Only the fixture reauthorizes this refused cleanup; production must not retry it.
     await placements.releaseTurn(retained);
+  },
+);
+
+it.each(["reclaim", "mutation"] as const)(
+  "continues and settles %s workspace custody without caller-thread SQL",
+  async (purpose) => {
+    const identity = input(`result-${purpose}`);
+    const active = await advancePlacementFixtureToActive(
+      placements,
+      database,
+      {
+        ...identity,
+        executionMode: "remote-exec",
+      },
+      { environmentId: `result-environment-${purpose}` },
+    );
+    const claimId = `reclaim-result-${purpose}`;
+    const requested = {
+      ...identity,
+      claimId,
+      runId: claimId,
+      owner: {
+        kind: "local" as const,
+        environmentId: active.environmentId,
+        ownerEpoch: active.activeOwnerEpoch,
+      },
+    };
+    const queries = observeHostDataSql();
+    try {
+      const claim =
+        purpose === "reclaim"
+          ? await placements.claimReclaimWorkspaceResult(requested)
+          : await placements.claimWorkspaceMutationResult(requested);
+      expect(placements.validateWorkspaceResultClaim(claim)).toBe(true);
+      await placements.markWorkspaceResultPending(claim);
+      const stagedResultRef = `refs/openclaw/worker-results/${claimId}`;
+      await placements.recordStagedWorkspaceResult(claim, stagedResultRef);
+      placements.recordWorkspaceResultConflict(claim, { paths: ["conflict.txt"], stagedResultRef });
+      expect(await placements.startWorkspaceResultDrain(claim)).toMatchObject({
+        state: "draining",
+        generation: claim.placementGeneration + 1,
+      });
+      expect(placements.validateWorkspaceResultClaim(claim)).toBe(true);
+      placements.recordWorkspaceResultConflict(claim, undefined);
+      await placements.handoffWorkspaceResultRecovery(claim);
+      expect(await placements.listPendingWorkspaceResultsAsync(claim.sessionId)).toMatchObject([
+        { claimId, recoveryRequestedAtMs: 1_000, workspaceAcceptedAtMs: null },
+      ]);
+      await placements.acceptWorkspaceResult(claim);
+      expect(placements.validateWorkspaceResultClaim(claim)).toBe(true);
+      await placements.completeWorkspaceResultAndReleaseTurn(claim);
+      expect(placements.validateWorkspaceResultClaim(claim)).toBe(false);
+      expect(await placements.listPendingWorkspaceResultsAsync(claim.sessionId)).toEqual([]);
+      const cancelled = await placements.claimReclaimWorkspaceResult(requested);
+      await placements.cancelWorkspaceResultAndReleaseTurn(cancelled);
+      const abandoned = await placements.claimReclaimWorkspaceResult(requested);
+      const [pending] = await placements.listPendingWorkspaceResultsAsync(abandoned.sessionId);
+      if (!pending) {
+        throw new Error("Fixture lost its pending result");
+      }
+      await placements.abandonWorkspaceResult(pending);
+      await placements.releaseTurn(abandoned);
+      expect(queries.queries).toEqual([]);
+    } finally {
+      queries.restore();
+    }
+  },
+);
+
+it("rejects result acceptance when the live caller is revoked before commit", async () => {
+  const claim = await workerClaim("result-accept-revoked");
+  await placements.markWorkspaceResultPending(claim);
+  let revoked = false;
+  const createAdmission = operationAdmission.createSqliteWorkerOperationAdmission;
+  vi.spyOn(operationAdmission, "createSqliteWorkerOperationAdmission").mockImplementationOnce(
+    (admit, attachment) =>
+      createAdmission((request, grant) => {
+        if (request.stage === "commit") {
+          revoked = true;
+        }
+        admit(request, grant);
+      }, attachment),
+  );
+  await expect(
+    placements.acceptWorkspaceResult(claim, () => {
+      if (revoked) {
+        throw new Error("result caller revoked");
+      }
+    }),
+  ).rejects.toThrow("result caller revoked");
+  expect(
+    (await placements.listPendingWorkspaceResultsAsync(claim.sessionId))[0]?.workspaceAcceptedAtMs,
+  ).toBeNull();
+  expect(placements.validateWorkspaceResultClaim(claim)).toBe(true);
+  await placements.acceptWorkspaceResult(claim);
+  await placements.completeWorkspaceResultAndReleaseTurn(claim);
+});
+
+it.each(["prepare", "release"] as const)(
+  "keeps the successor result authorized when stale %s does not own it",
+  async (operation) => {
+    const name = `result-successor-${operation}`;
+    const previous = await workerClaim(name);
+    await placements.releaseTurn(previous);
+    const next = await placements.claimTurn({
+      ...input(name),
+      claimId: `successor-${operation}`,
+      runId: `successor-run-${operation}`,
+      owner: previous.owner,
+    });
+    await placements.markWorkspaceResultPending(next);
+    try {
+      expect(placements.validateWorkspaceResultClaim(next)).toBe(true);
+      if (operation === "prepare") {
+        await expect(placements.prepareWorkspaceResultClaim(previous)).rejects.toThrow(
+          "workspace result authority changed",
+        );
+      } else {
+        await placements.releaseTurnIfOwned(previous);
+      }
+      expect(await placements.listPendingWorkspaceResultsAsync(next.sessionId)).toMatchObject([
+        { claimId: next.claimId, runId: next.runId },
+      ]);
+      expect(placements.validateWorkspaceResultClaim(next)).toBe(true);
+    } finally {
+      await placements.acceptWorkspaceResult(next);
+      await placements.completeWorkspaceResultAndReleaseTurn(next);
+    }
   },
 );

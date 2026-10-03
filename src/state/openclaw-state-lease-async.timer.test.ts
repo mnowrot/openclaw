@@ -35,6 +35,7 @@ vi.mock("./openclaw-state-lease-worker-storage.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./openclaw-state-lease-worker-storage.js")>();
   return {
     ...actual,
+    acquireLease: mocks.forbidden,
     createOpenClawStateLeaseWorkerStorage: (context: OpenClawStateWorkerContext) =>
       mocks.configureStorage(actual.createOpenClawStateLeaseWorkerStorage(context)),
   };
@@ -59,29 +60,19 @@ vi.mock("./openclaw-state-lease-storage.js", () => ({
   isOpenClawStateLeaseWriteContention: () => false,
   releaseOpenClawStateLeaseBestEffort: async (_params: unknown, execute?: () => Promise<void>) =>
     execute?.(),
-  readLeaseDatabase: mocks.forbidden,
   resolveLeaseDatabasePath: mocks.forbidden,
-  acquireLease: mocks.forbidden,
   renewOpenClawStateLease: mocks.forbidden,
-  assertOpenClawStateLeaseOwnedInDatabase: mocks.forbidden,
   verifyOpenClawStateLeaseOwnership: mocks.forbidden,
   releaseOpenClawStateLease: mocks.forbidden,
 }));
 vi.mock("./openclaw-state-db-readonly.js", () => ({
   withExistingOpenClawStateDatabaseArtifactPreservingReadOnly: mocks.forbidden,
 }));
-vi.mock("./openclaw-state-lease-exclusion.js", () => ({
-  createOpenClawStateLeaseExclusion: mocks.forbidden,
-}));
 vi.mock("../infra/sqlite-worker-identity.js", () => ({
   inspectDatabasePathIdentitySync: mocks.forbidden,
   readDatabasePathIdentitySync: mocks.forbidden,
 }));
-vi.mock("../infra/state-database-coordinator.js", () => ({
-  acquireStateDatabaseHandleLease: mocks.forbidden,
-  retainHeldStateDatabaseCoordinator: mocks.forbidden,
-  withStateDatabaseCoordinatorRuntimeDirectory: mocks.forbidden,
-}));
+
 beforeEach(() => {
   vi.clearAllMocks();
   vi.useFakeTimers({
@@ -110,7 +101,7 @@ function observe<T>(promise: Promise<T>) {
 }
 
 function fixture() {
-  const maintenance = createOpenClawDatabaseMaintenanceScope(mocks.forbidden);
+  const maintenance = createOpenClawDatabaseMaintenanceScope();
   const resources = new Set<OpenClawStateDatabaseAsyncResource>();
   const leaseMs = 3_000;
   let committedExpiry = Date.now() + leaseMs;
@@ -122,9 +113,9 @@ function fixture() {
   const events: string[] = [];
   const context: OpenClawStateWorkerContext = {
     environment: { OPENCLAW_STATE_DIR: "/synthetic-state" },
-    coordinatorRuntime: { directory: "/synthetic-coordinator", keepAlive: false },
     maintenanceScope: maintenance,
     admission: {
+      coordinationKey: "file:synthetic-state",
       databasePath: "/synthetic-state/lease.sqlite",
       identity: { key: "file:synthetic-state", canonicalPath: "/synthetic-state/lease.sqlite" },
       assertCurrent() {
@@ -214,9 +205,16 @@ function fixture() {
     );
   return {
     run,
+    enter(result: ReturnType<typeof run>) {
+      return Promise.race([
+        entered.promise,
+        result.outcome.then((outcome) => {
+          throw outcome.ok ? new Error("Lease completed before callback") : outcome.error;
+        }),
+      ]);
+    },
     maintenance,
     resources,
-    entered,
     finishCallback,
     onRenew,
     onVerify,
@@ -242,12 +240,7 @@ describe("async state lease timer", () => {
     });
     const result = f.run();
     try {
-      const { lease, within } = await Promise.race([
-        f.entered.promise,
-        result.outcome.then((outcome) => {
-          throw outcome.ok ? new Error("Lease completed before callback") : outcome.error;
-        }),
-      ]);
+      const { lease, within } = await f.enter(result);
       await within(() => vi.advanceTimersByTimeAsync(1_000));
       await renewing.promise;
       f.finishCallback.resolve();
@@ -298,12 +291,7 @@ describe("async state lease timer", () => {
     });
     const result = f.run();
     try {
-      const { lease, within } = await Promise.race([
-        f.entered.promise,
-        result.outcome.then((outcome) => {
-          throw outcome.ok ? new Error("Lease completed before callback") : outcome.error;
-        }),
-      ]);
+      const { lease, within } = await f.enter(result);
       await within(() => vi.advanceTimersByTimeAsync(1_000));
       await committed.promise;
       await within(() => vi.advanceTimersByTimeAsync(2_000));
@@ -330,12 +318,7 @@ describe("async state lease timer", () => {
       const reply = createDeferredCore();
       const result = f.run();
       try {
-        const { lease, within } = await Promise.race([
-          f.entered.promise,
-          result.outcome.then((outcome) => {
-            throw outcome.ok ? new Error("Lease completed before callback") : outcome.error;
-          }),
-        ]);
+        const { lease, within } = await f.enter(result);
         f.onVerify.mockImplementationOnce(async (command) => {
           const expiresAt = command.publish(Date.now() + 3_000);
           checked.resolve();

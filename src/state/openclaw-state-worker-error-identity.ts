@@ -1,16 +1,31 @@
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { DuplicateAgentError } from "../agents/agent-create-error.js";
 import { McpOAuthStoreCorruptionError } from "../agents/mcp-oauth-store-error.js";
 import { WorkspaceAliasRepointedError } from "../agents/workspace-state-identity.js";
+import {
+  SESSION_GOAL_OPERATION_ERROR_CODES,
+  SessionGoalOperationError,
+  type SessionGoalOperationErrorCode,
+} from "../config/sessions/goals-operations.types.js";
+import { SessionPendingInputCustodyError } from "../config/sessions/session-pending-input-custody-error.js";
 import { WorkerSessionAlreadyAttachedError } from "../gateway/worker-environments/session-attachment.js";
-import { SqliteCoordinatorError } from "../infra/sqlite-coordinator.js";
+import { GatewayStateOwnerContentionError } from "../infra/gateway-state-owner.js";
+import {
+  SqliteCoordinatorError,
+  OpenClawStateExternalOwnershipError,
+  OpenClawStateOwnershipError,
+  OpenClawStateOwnershipMetadataError,
+} from "../infra/sqlite-lifecycle-errors.js";
 import { SqliteSchemaVersionError } from "../infra/sqlite-user-version.js";
 import {
   isStartupMaintenanceKind,
   StartupMaintenanceRequiredError,
 } from "../infra/startup-maintenance-required.js";
-import type { StateDatabaseCoordinatorOwner } from "../infra/state-database-coordinator-owner.js";
-import { StateDatabaseCoordinatorContentionError } from "../infra/state-database-coordinator.js";
 import { PluginBlobStoreError } from "../plugin-state/plugin-blob-store.types.js";
+import {
+  SecretStoreValidationError,
+  isSecretStoreValidationCode,
+} from "../secrets/store/secret-store-validation-error.js";
+import { SkillLibraryError, type SkillLibraryErrorCode } from "../skills/library/errors.js";
 import { SkillUploadRequestError } from "../skills/lifecycle/upload-store-error.js";
 import { OpenClawAgentDatabaseMediaMigrationRequiredError } from "./openclaw-agent-db-migration-required.js";
 import { OpenClawStateDatabaseSchemaMigrationRequiredError } from "./openclaw-state-db-schema-migration-required.js";
@@ -19,20 +34,16 @@ import {
   OpenClawStateLeaseError,
   type OpenClawStateLeaseErrorCode,
 } from "./openclaw-state-lease-error.js";
-import {
-  OpenClawStateExternalOwnershipError,
-  OpenClawStateOwnershipError,
-  OpenClawStateOwnershipMetadataError,
-} from "./openclaw-state-ownership.js";
 import { SessionMetadataUnavailableError } from "./session-metadata-unavailable-error.js";
 
 type MaintenanceKind = ConstructorParameters<typeof StartupMaintenanceRequiredError>[0];
 type StateMigrationKind = ConstructorParameters<
   typeof OpenClawStateDatabaseSchemaMigrationRequiredError
 >[0];
-type CoordinatorFamily = ConstructorParameters<typeof StateDatabaseCoordinatorContentionError>[0];
 
 export type ErrorIdentity =
+  | { type: "secret-store-validation"; secretCode: SecretStoreValidationError["code"] }
+  | { type: "session-goal-operation"; goalCode: SessionGoalOperationErrorCode }
   | { type: "worker-session-already-attached"; sessionId: string; environmentId: string }
   | {
       type: "workspace-alias-repointed";
@@ -50,17 +61,16 @@ export type ErrorIdentity =
         | "range-error"
         | "syntax-error"
         | "type-error"
+        | "duplicate-agent"
         | "skill-upload-request"
-        | "mcp-oauth-corruption";
+        | "mcp-oauth-corruption"
+        | "session-pending-input-custody";
     }
-  | {
-      type: "coordinator-contention";
-      family: CoordinatorFamily;
-      blockingOwner?: StateDatabaseCoordinatorOwner;
-    }
+  | { type: "state-owner-contention"; databasePath: string }
   | { type: "ownership-metadata"; databasePath: string }
   | { type: "external-ownership"; databasePath: string; managerId: string }
   | { type: "state-lease"; leaseCode: OpenClawStateLeaseErrorCode }
+  | { type: "skill-library"; libraryCode: SkillLibraryErrorCode; currentRevision?: string }
   | {
       type: "plugin-blob";
       blobCode: PluginBlobStoreError["code"];
@@ -77,6 +87,19 @@ export type ErrorIdentity =
   | { type: "agent-media-migration"; pathname: string; schemaVersion: number };
 
 export function identifyError(error: Error): ErrorIdentity {
+  if (error instanceof SkillLibraryError) {
+    return {
+      type: "skill-library",
+      libraryCode: error.code,
+      ...(error.currentRevision === undefined ? {} : { currentRevision: error.currentRevision }),
+    };
+  }
+  if (error instanceof SecretStoreValidationError) {
+    return { type: "secret-store-validation", secretCode: error.code };
+  }
+  if (error instanceof DuplicateAgentError) {
+    return { type: "duplicate-agent" };
+  }
   if (error instanceof WorkerSessionAlreadyAttachedError) {
     return {
       type: "worker-session-already-attached",
@@ -103,6 +126,12 @@ export function identifyError(error: Error): ErrorIdentity {
   if (error instanceof McpOAuthStoreCorruptionError) {
     return { type: "mcp-oauth-corruption" };
   }
+  if (error instanceof SessionGoalOperationError) {
+    return { type: "session-goal-operation", goalCode: error.code };
+  }
+  if (error instanceof SessionPendingInputCustodyError) {
+    return { type: "session-pending-input-custody" };
+  }
   if (error instanceof SessionMetadataUnavailableError) {
     return {
       type: "session-metadata",
@@ -113,12 +142,8 @@ export function identifyError(error: Error): ErrorIdentity {
   if (error instanceof SkillUploadRequestError) {
     return { type: "skill-upload-request" };
   }
-  if (error instanceof StateDatabaseCoordinatorContentionError) {
-    return {
-      type: "coordinator-contention",
-      family: error.family,
-      ...(error.blockingOwner ? { blockingOwner: { ...error.blockingOwner } } : {}),
-    };
+  if (error instanceof GatewayStateOwnerContentionError) {
+    return { type: "state-owner-contention", databasePath: error.databasePath };
   }
   if (error instanceof SqliteCoordinatorError) {
     return { type: "coordinator" };
@@ -190,27 +215,38 @@ function isBlobOperation(value: unknown): value is PluginBlobStoreError["operati
   );
 }
 
-function isCoordinatorFamily(value: unknown): value is CoordinatorFamily {
-  return value === "gateway-lifecycle" || value === "state-lifecycle" || value === "state-handles";
-}
-
-function isCoordinatorOwner(value: unknown): value is StateDatabaseCoordinatorOwner {
+function isSkillLibraryCode(value: unknown): value is SkillLibraryErrorCode {
   return (
-    isRecord(value) &&
-    Object.keys(value).every((key) => ["pid", "startTime", "command", "family"].includes(key)) &&
-    typeof value.pid === "number" &&
-    Number.isSafeInteger(value.pid) &&
-    value.pid > 0 &&
-    typeof value.startTime === "number" &&
-    Number.isFinite(value.startTime) &&
-    value.startTime >= 0 &&
-    typeof value.command === "string" &&
-    isCoordinatorFamily(value.family)
+    value === "IDENTITY_REQUIRED" ||
+    value === "FORBIDDEN" ||
+    value === "NOT_FOUND" ||
+    value === "CONFLICT" ||
+    value === "NAME_CONFLICT" ||
+    value === "INVALID_BUNDLE" ||
+    value === "POLICY_BLOCKED" ||
+    value === "AUTHORITY_EXPIRED" ||
+    value === "LIMIT"
   );
 }
 
 export function parseIdentity(node: Record<string, unknown>): ErrorIdentity | undefined {
   switch (node.type) {
+    case "skill-library":
+      return isSkillLibraryCode(node.libraryCode) &&
+        node.code === node.libraryCode &&
+        (node.currentRevision === undefined || typeof node.currentRevision === "string")
+        ? {
+            type: node.type,
+            libraryCode: node.libraryCode,
+            ...(typeof node.currentRevision === "string"
+              ? { currentRevision: node.currentRevision }
+              : {}),
+          }
+        : undefined;
+    case "secret-store-validation":
+      return isSecretStoreValidationCode(node.secretCode) && node.code === node.secretCode
+        ? { type: node.type, secretCode: node.secretCode }
+        : undefined;
     case "worker-session-already-attached":
       return typeof node.sessionId === "string" && typeof node.environmentId === "string"
         ? { type: node.type, sessionId: node.sessionId, environmentId: node.environmentId }
@@ -234,24 +270,22 @@ export function parseIdentity(node: Record<string, unknown>): ErrorIdentity | un
     case "range-error":
     case "syntax-error":
     case "type-error":
+    case "duplicate-agent":
     case "skill-upload-request":
     case "mcp-oauth-corruption":
+    case "session-pending-input-custody":
       return { type: node.type };
+    case "session-goal-operation": {
+      const goalCode = SESSION_GOAL_OPERATION_ERROR_CODES.find((code) => code === node.goalCode);
+      return goalCode && node.code === goalCode ? { type: node.type, goalCode } : undefined;
+    }
     case "session-metadata":
       return (node.reason === "schema-missing" || node.reason === "table-missing") &&
         Array.isArray(node.missingTables) &&
         node.missingTables.every((table: unknown) => typeof table === "string")
         ? { type: node.type, reason: node.reason, missingTables: [...node.missingTables] }
         : undefined;
-    case "coordinator-contention":
-      return isCoordinatorFamily(node.family) &&
-        (node.blockingOwner === undefined || isCoordinatorOwner(node.blockingOwner))
-        ? {
-            type: node.type,
-            family: node.family,
-            ...(node.blockingOwner ? { blockingOwner: { ...node.blockingOwner } } : {}),
-          }
-        : undefined;
+    case "state-owner-contention":
     case "ownership-metadata":
       return typeof node.databasePath === "string"
         ? { type: node.type, databasePath: node.databasePath }
@@ -279,8 +313,7 @@ export function parseIdentity(node: Record<string, unknown>): ErrorIdentity | un
     case "maintenance":
       return isStartupMaintenanceKind(node.kind) ? { type: node.type, kind: node.kind } : undefined;
     case "state-migration":
-      return (node.kind === "agent-databases-composite-primary-key" ||
-        node.kind === "audit-events-v2" ||
+      return (node.kind === "audit-events-v2" ||
         node.kind === "legacy-cron-run-logs" ||
         node.kind === "legacy-workshop-review-index") &&
         typeof node.pathname === "string"
@@ -304,10 +337,20 @@ function unreachableErrorNode(node: never): never {
 
 export function createError(node: ErrorIdentity & { message: string }): Error {
   switch (node.type) {
+    case "skill-library":
+      return new SkillLibraryError(node.libraryCode, node.message, node.currentRevision);
+    case "secret-store-validation":
+      return new SecretStoreValidationError(node.secretCode, node.message);
+    case "duplicate-agent":
+      return new DuplicateAgentError(node.message);
     case "worker-session-already-attached":
       return new WorkerSessionAlreadyAttachedError(node.sessionId, node.environmentId);
     case "workspace-alias-repointed":
       return new WorkspaceAliasRepointedError(node);
+    case "session-goal-operation":
+      return new SessionGoalOperationError(node.goalCode, node.message);
+    case "session-pending-input-custody":
+      return new SessionPendingInputCustodyError(node.message);
     case "session-metadata":
       return new SessionMetadataUnavailableError(node.reason, undefined, node.missingTables);
     case "error":
@@ -326,8 +369,8 @@ export function createError(node: ErrorIdentity & { message: string }): Error {
       return new AggregateError([], node.message);
     case "coordinator":
       return new SqliteCoordinatorError(node.message);
-    case "coordinator-contention":
-      return new StateDatabaseCoordinatorContentionError(node.family, node.blockingOwner);
+    case "state-owner-contention":
+      return new GatewayStateOwnerContentionError(node.databasePath);
     case "ownership":
       return new OpenClawStateOwnershipError(node.message);
     case "ownership-metadata":

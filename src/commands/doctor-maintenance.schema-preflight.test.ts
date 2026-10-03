@@ -14,7 +14,7 @@ import { extractSqliteTableSchema } from "../infra/sqlite-schema-sql.js";
 import { createLegacyDatabaseFixture } from "../infra/state-migrations.media-persistence.test-support.js";
 import { setLoggerOverride } from "../logging/logger.js";
 import { testApi } from "../logging/logger.test-support.js";
-import { readAgentDeletionRecoveryHolds } from "../state/agent-deletion-journal-recovery.js";
+import { readAgentDeletionRecoveryHolds } from "../state/agent-deletion-journal-recovery.kernel.js";
 import { OPENCLAW_AGENT_SCHEMA_VERSION } from "../state/openclaw-agent-db-contract.js";
 import { unregisterOpenClawAgentDatabase } from "../state/openclaw-agent-db-registry.js";
 import { recordOpenClawDatabaseQuarantine } from "../state/openclaw-quarantine-store.js";
@@ -89,7 +89,9 @@ it("admits a supported legacy registry without weakening runtime target validati
   try {
     expect(maintenance).toBeDefined();
     expect(fs.readFileSync(fixture.databasePath)).toEqual(before);
-    expect(resolveRuntimeTargets).toThrow("legacy agent database registry schema");
+    expect(() => maintenance?.run(resolveRuntimeTargets)).toThrow(
+      "legacy agent database registry schema",
+    );
   } finally {
     await maintenance?.release();
   }

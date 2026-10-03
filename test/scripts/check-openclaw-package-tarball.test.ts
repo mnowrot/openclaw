@@ -13,6 +13,7 @@ import {
   PACKAGE_LIFECYCLE_PENDING_RELATIVE_PATH,
 } from "../../scripts/lib/package-lifecycle-marker.mjs";
 import { WORKSPACE_TEMPLATE_PACK_PATHS } from "../../scripts/lib/workspace-bootstrap-smoke.mts";
+import { resolveTestNodeExecPath } from "../../src/test-utils/node-process.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 import {
   CODE_MODE_WORKER_PATH,
@@ -220,7 +221,7 @@ childProcess.spawnSync = function (...callArgs) {
 syncBuiltinESMExports();
 `,
         );
-        const result = spawnSync(process.execPath, [resolve(CHECK_SCRIPT), tarball], {
+        const result = spawnSync(resolveTestNodeExecPath(), [resolve(CHECK_SCRIPT), tarball], {
           encoding: "utf8",
           env: {
             ...process.env,
@@ -1085,6 +1086,52 @@ syncBuiltinESMExports();
   );
 
   const bundledRuntimeCases: NamedTarballCheck[] = [
+    ...[
+      { bundledPeer: false, optional: false },
+      { bundledPeer: false, optional: true },
+      { bundledPeer: true, optional: false },
+    ].map(({ bundledPeer, optional }): NamedTarballCheck => ({
+      name: `${bundledPeer ? "accepts" : "rejects"} a bundled dependency with ${bundledPeer ? "a bundled" : "a missing"} root-required ${optional ? "optional" : "required"} peer`,
+      files: {
+        "dist/index.js": "export {};\n",
+        "node_modules/example/package.json": JSON.stringify({
+          name: "example",
+          version: "1.0.0",
+          peerDependencies: { host: "^1.0.0" },
+          ...(optional ? { peerDependenciesMeta: { host: { optional: true } } } : {}),
+        }),
+        ...(bundledPeer
+          ? { "node_modules/host/package.json": '{"name":"host","version":"1.0.0"}\n' }
+          : {}),
+      },
+      options: {
+        packageJson: {
+          dependencies: { example: "1.0.0", host: "1.0.0" },
+          bundleDependencies: bundledPeer ? ["example", "host"] : ["example"],
+        },
+      },
+      status: bundledPeer ? 0 : "nonzero",
+      stderr: bundledPeer ? [] : ["bundled example is missing its root dependency peer host"],
+    })),
+    {
+      name: "accepts an absent optional peer of a bundled dependency",
+      files: {
+        "dist/index.js": "export {};\n",
+        "node_modules/example/package.json": JSON.stringify({
+          name: "example",
+          version: "1.0.0",
+          peerDependencies: { host: "^1.0.0" },
+          peerDependenciesMeta: { host: { optional: true } },
+        }),
+      },
+      options: {
+        packageJson: {
+          dependencies: { example: "1.0.0" },
+          bundleDependencies: ["example"],
+        },
+      },
+      status: 0,
+    },
     {
       name: "accepts npm-selected bundled and hoisted transitive dependency paths",
       files: {

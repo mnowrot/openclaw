@@ -24,15 +24,12 @@ export type DispatchGatewayMethodInProcessOptions = {
   privateCompletion?: true;
   settleWakeReplay?: RequesterSettleWakeReplay;
   allowSyntheticModelOverride?: boolean;
-  allowSyntheticCronRunContinuation?: boolean;
   agentToolCaller?: TrustedAgentToolCaller;
   agentRunTracking?: GatewayAgentRunTaskOwner;
   cancelOnDeadline?: boolean;
   disableSyntheticClient?: boolean;
   expectFinal?: boolean;
   forceSyntheticClient?: boolean;
-  internalDeliveryMediaUrls?: string[];
-  internalDeliverySuppressText?: boolean;
   nodeInvokeStream?: GatewayNodeInvokeStream;
   nodeInvokeApprovalSessionKey?: string;
   onAccepted?: (payload: unknown) => void;
@@ -54,10 +51,13 @@ export type DispatchGatewayMethodInProcessOptions = {
   signal?: AbortSignal;
   hasCurrentClientAuthority?: GatewayRequestOptions["hasCurrentClientAuthority"];
   resolveGatewayContext?: GatewayContextResolver;
+  prepareDispatchCurrent?: () => Promise<void>;
   sessionMutationCommitGuard?: () => void;
 };
 
 export type ResolvedInProcessGatewayDispatch = {
+  /** Source custody after an accepted transfer, independent of its authorizing invocation. */
+  assertSourceCurrent: () => void;
   assertContextCurrent: () => void;
   assertCreatedInputSourceCurrent?: () => void;
   assertInvocationCurrent: () => void;
@@ -78,4 +78,6 @@ export type OperatorToolGatewayAuthority = {
   operatorRunAuthority?: AdmittedRunOperatorAuthority;
   signal: AbortSignal;
   assertCurrent?: () => void;
+  /** Pure input policy; applies at effects, never settled results or cleanup. */
+  assertInputCommitAllowed?: () => void;
 };

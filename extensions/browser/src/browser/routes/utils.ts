@@ -1,12 +1,10 @@
-/**
- * Browser route utility functions.
- *
- * Profile lookup, JSON errors, and route value coercion shared across browser
- * control endpoints.
- */
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { isLocalManagedProfile } from "../config.js";
-import { BrowserProfileUnavailableError, type BrowserErrorResponse } from "../errors.js";
+import {
+  BrowserProfileUnavailableError,
+  type BrowserErrorResponse,
+  toBrowserErrorResponse,
+} from "../errors.js";
 import { isManagedOnlyBrowserRequest, resolveRequestedBrowserProfile } from "../request-policy.js";
 import {
   type BrowserRouteContext,
@@ -29,7 +27,7 @@ export function getProfileContext(
     }
     return profile;
   } catch (err) {
-    const mapped = ctx.mapTabError(err);
+    const mapped = toBrowserErrorResponse(err);
     return mapped
       ? { error: mapped.message, status: mapped.status }
       : { error: String(err), status: 404 };
@@ -76,7 +74,6 @@ export async function runProfileRouteOperation<T>(params: {
   throw new Error("browser profile could not stabilize");
 }
 
-/** Send a simple JSON error response. */
 export function jsonError(res: BrowserResponse, status: number, message: string) {
   res.status(status).json({ error: message });
 }
@@ -131,7 +128,6 @@ export function toBoolean(value: unknown) {
   return undefined;
 }
 
-/** Coerce a route value to a string array when every entry is a string. */
 export function toStringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) {
     return undefined;
