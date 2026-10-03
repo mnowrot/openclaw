@@ -30,8 +30,10 @@ import {
   registerTestManagerCleanup,
 } from "./src/manager.test-harness.js";
 import { speak as speakWithContext } from "./src/manager/outbound.js";
-import { CALL_RECORD_EVENTS_NAMESPACE } from "./src/manager/store.js";
 import type { VoiceCallStateRuntime } from "./src/runtime-state.js";
+
+// These names are persisted storage contracts, independent of private store declarations.
+const CALL_RECORD_EVENTS_NAMESPACE = "call-record-events";
 
 type VoiceCallService = Parameters<OpenClawPluginApi["registerService"]>[0];
 type VoiceCallGatewayHandler = Parameters<OpenClawPluginApi["registerGatewayMethod"]>[1];
