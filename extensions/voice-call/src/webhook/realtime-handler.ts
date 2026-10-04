@@ -1019,13 +1019,15 @@ export class RealtimeCallHandler {
     let deferredCallerFinalIssued: Promise<void> | undefined;
     const issueAfterDeferredCallerFinal = <T>(issue: () => Promise<T>): Promise<T> =>
       deferredCallerFinalIssued ? deferredCallerFinalIssued.then(issue) : issue();
-    // Caller turns this connection has written, so the provider's cumulative flush can be
-    // reduced to text no turn write has claimed. The ledger belongs to the bridge, not the
-    // call: a replacement connection starts its own, and a provider close cannot clear a
-    // ledger a deferred flush still has to read. Turns are kept verbatim rather than
+    // Caller turns this provider generation has written, so the provider's cumulative flush
+    // can be reduced to text no turn write has claimed. The ledger belongs to the bridge, not
+    // the call: a replacement connection starts its own, and a provider close cannot clear a
+    // ledger a deferred flush still has to read. A continuity reset rebinds it, because the
+    // replacement provider session restates nothing the previous one heard; a flush already
+    // created keeps the ledger it captured. Turns are kept verbatim rather than
     // overlap-deduplicated, because a caller may repeat the same short phrase ("yes",
     // "yes") and both turns have to remain.
-    const committedCallerTurns: CallerTurnCommit[] = [];
+    let committedCallerTurns: CallerTurnCommit[] = [];
     const recordCommittedCallerTurn = (commit: CallerTurnCommit): CallerTurnCommit => {
       committedCallerTurns.push(commit);
       return commit;
@@ -1224,19 +1226,16 @@ export class RealtimeCallHandler {
           const streamedSinceCommit = { text: state.rawPartial ?? "" };
           this.clearPartialUserTranscript(callId, userTranscriptOwner);
           const generation = continuityGeneration;
+          const ledger = committedCallerTurns;
           // A provider that restates the call in this final has to be reduced to the
           // suffix no turn write has claimed. Turn writes hold a ledger slot from the
           // moment they are issued and mark it unstored only if they fail, so the ledger
           // is authoritative as soon as none are in flight.
           const flushResidualCallerText = async () => {
-            const reduction = reduceFinalCallerTranscript(
-              committedCallerTurns,
-              transcript,
-              streamedSinceCommit,
-            );
+            const reduction = reduceFinalCallerTranscript(ledger, transcript, streamedSinceCommit);
             // Claim only the turns this final restated: a later utterance repeating an
             // earlier phrase must still be stored as new speech.
-            committedCallerTurns.splice(0, reduction.claimedTurns);
+            ledger.splice(0, reduction.claimedTurns);
             // Restated turns whose own write failed land here, once, ahead of the new speech.
             const residualTranscript = [...reduction.recovered, reduction.residual]
               .filter(Boolean)
@@ -1387,6 +1386,7 @@ export class RealtimeCallHandler {
       onEvent: (event) => {
         if (event.direction === "client" && event.type === "session.continuity.reset") {
           continuityGeneration += 1;
+          committedCallerTurns = [];
           // A fresh provider session cannot complete the prior session's text,
           // audio, tool work, or Talk turn.
           const turnId = harness.talk.activeTurnId;

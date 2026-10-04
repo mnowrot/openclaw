@@ -344,6 +344,26 @@ describe("RealtimeCallHandler stored dialogue", () => {
     ]);
   });
 
+  it("does not reduce a reconnected provider's flush against the prior session's turns", async () => {
+    const dialogue = await startDialogue();
+    dialogue.callbacks.onTranscript?.("user", "book a table", false);
+    dialogue.callbacks.onTranscript?.("assistant", "First reply", true);
+    // A non-resumable reconnect drops the provider's accumulated input transcript, so
+    // its end-of-call flush restates only what the replacement session heard.
+    dialogue.callbacks.onEvent?.({ direction: "client", type: "session.continuity.reset" });
+    dialogue.callbacks.onTranscript?.("user", "for two people", false);
+    dialogue.callbacks.onTranscript?.("assistant", "Second reply", true);
+    closeLikeGoogleLive(dialogue.callbacks, "for two people");
+
+    expect(await dialogue.close()).toBeUndefined();
+    expect(await dialogue.readStoredTranscript()).toEqual([
+      ["user", "book a table"],
+      ["bot", "First reply"],
+      ["user", "for two people"],
+      ["bot", "Second reply"],
+    ]);
+  });
+
   it("stores a caller final deferred behind a pending turn write ahead of its reply", async () => {
     const dialogue = await startDialogue({ transcript: "yes", mode: "hold" });
     dialogue.callbacks.onTranscript?.("user", "yes", false);
