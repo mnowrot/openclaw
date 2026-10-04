@@ -1818,9 +1818,9 @@ export class RealtimeCallHandler {
 
   /**
    * Take the caller's pending partial turn text to persist as a committed caller
-   * entry, subtracting it from the live partial buffer. The bridge's committed-caller
-   * ledger (used to reduce a cumulative provider final) records the turn separately,
-   * as its write is issued.
+   * entry, spending the persistence deltas so the next assistant boundary cannot
+   * commit the turn again. The bridge's committed-caller ledger (used to reduce a
+   * cumulative provider final) records the turn separately, as its write is issued.
    */
   private takeCallerTurnCommitText(
     callId: string,
@@ -1833,11 +1833,8 @@ export class RealtimeCallHandler {
     if (!pending) {
       return undefined;
     }
-    const commit = { text: pending };
-    if (state?.partial) {
-      this.consumePartialUserTranscript(callId, owner, state.partial);
-    }
-    return commit;
+    this.clearPartialUserTranscript(callId, owner);
+    return { text: pending };
   }
 
   private clearUserTranscriptState(callId: string, owner: UserTranscriptState): void {
@@ -1924,7 +1921,12 @@ export class RealtimeCallHandler {
     return state?.partial ?? state?.recentFinal;
   }
 
-  private consumePartialUserTranscript(
+  /**
+   * Spend the consult context a completed consultation answered. The persistence
+   * deltas stay: only the storage path (assistant-boundary commit, caller final)
+   * consumes them, so a consult finishing first cannot drop the turn from the store.
+   */
+  private consumeConsultationContext(
     callId: string,
     owner: UserTranscriptState,
     consumed: string | undefined,
@@ -1939,17 +1941,11 @@ export class RealtimeCallHandler {
       return;
     }
     if (current === text) {
-      this.clearPartialUserTranscript(callId, owner);
+      state.partial = undefined;
       return;
     }
     if (current.toLowerCase().startsWith(text.toLowerCase())) {
-      const remaining = current.slice(text.length).trimStart();
-      if (remaining) {
-        state.partial = remaining;
-        state.rawPartial = remaining;
-      } else {
-        this.clearPartialUserTranscript(callId, owner);
-      }
+      state.partial = current.slice(text.length).trimStart() || undefined;
     }
     const recent = state.recentFinal;
     if (!recent) {
@@ -2098,7 +2094,7 @@ export class RealtimeCallHandler {
       console.log(
         `[voice-call] realtime forced agent consult completed callId=${params.callId} providerCallId=${params.callSid} elapsedMs=${Date.now() - startedAt}`,
       );
-      this.consumePartialUserTranscript(
+      this.consumeConsultationContext(
         params.callId,
         params.userTranscriptOwner,
         params.handle.question,
@@ -2408,11 +2404,7 @@ export class RealtimeCallHandler {
         const failed = logResult(result);
         await submitFinalToolResult(result);
         if (!failed) {
-          this.consumePartialUserTranscript(
-            callId,
-            userTranscriptOwner,
-            state.partialUserTranscript,
-          );
+          this.consumeConsultationContext(callId, userTranscriptOwner, state.partialUserTranscript);
         }
         return result;
       } finally {

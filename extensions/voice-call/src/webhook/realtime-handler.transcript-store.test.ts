@@ -33,6 +33,7 @@ describe("RealtimeCallHandler stored dialogue", () => {
   async function startDialogue(gate?: { transcript: string; mode: "hold" | "fail" }): Promise<{
     callbacks: RealtimeVoiceBridgeCreateRequest;
     close: () => Promise<unknown>;
+    consult: (question: string) => Promise<void>;
     gateReached: Promise<void>;
     order: string[];
     readStoredTranscript: () => Promise<string[][] | undefined>;
@@ -75,9 +76,10 @@ describe("RealtimeCallHandler stored dialogue", () => {
     });
 
     const ready = createDeferred<RealtimeVoiceBridgeCreateRequest>();
+    let consultAnswered = createDeferred<void>();
     const realtimeProvider = makeRealtimeProvider((request) => {
       ready.resolve(request);
-      return createBridge(() => {});
+      return createBridge(() => {}, { submitToolResult: () => consultAnswered.resolve() });
     });
     const handler = new RealtimeCallHandler(
       createRealtimeConfig(),
@@ -101,6 +103,7 @@ describe("RealtimeCallHandler stored dialogue", () => {
       "/voice/webhook",
       noOpStreamDisconnectLifecycle,
     );
+    handler.registerToolHandler("openclaw_agent_consult", async () => ({ text: "Consulted." }));
     // The harness owns ws/server teardown via onTestFinished, so this scope must not
     // close the carrier server itself: a second close rejects with ERR_SERVER_NOT_RUNNING.
     const { ws } = await connectCarrierStream(handler);
@@ -121,6 +124,21 @@ describe("RealtimeCallHandler stored dialogue", () => {
         );
         order.push("close");
         return outcome;
+      },
+      consult: async (question) => {
+        consultAnswered = createDeferred<void>();
+        callbacks.onToolCall?.({
+          itemId: "consult-item",
+          callId: "consult-call",
+          name: "openclaw_agent_consult",
+          args: { question },
+        });
+        await consultAnswered.promise;
+        // The handler spends the consult context right after the provider has its
+        // answer; a macrotask turn lets that continuation finish.
+        await new Promise<void>((resolve) => {
+          setImmediate(resolve);
+        });
       },
       gateReached: gateReached.promise,
       order,
@@ -156,6 +174,22 @@ describe("RealtimeCallHandler stored dialogue", () => {
     callbacks.onClose?.("completed");
   }
 
+  /**
+   * A consult waits for the caller's partials to go quiet. Stamping the partial in the
+   * past lets the consult start at once without moving the clock the store writes use.
+   */
+  function streamSettledCallerPartial(
+    callbacks: RealtimeVoiceBridgeCreateRequest,
+    text: string,
+  ): void {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() - 1_000);
+    try {
+      callbacks.onTranscript?.("user", text, false);
+    } finally {
+      clock.mockRestore();
+    }
+  }
+
   it("stores each caller turn ahead of the reply it answered", async () => {
     const dialogue = await startDialogue();
     speakDialogue(dialogue.callbacks);
@@ -189,6 +223,25 @@ describe("RealtimeCallHandler stored dialogue", () => {
       ["user", `${first}${second}`],
       ["bot", "Details received"],
       ["user", "Goodbye."],
+    ]);
+  });
+
+  it("stores a consulted caller turn once when the final restates the call", async () => {
+    const dialogue = await startDialogue();
+    dialogue.callbacks.onTranscript?.("user", "What is the status?", false);
+    dialogue.callbacks.onTranscript?.("assistant", "Checking", true);
+    streamSettledCallerPartial(dialogue.callbacks, "Check the deployment.");
+    // A completed consult spends its own context, not the deltas the turn is stored from.
+    await dialogue.consult("Check the deployment.");
+    dialogue.callbacks.onTranscript?.("assistant", "Deployment is healthy", true);
+    closeLikeGoogleLive(dialogue.callbacks, "What is the status? Check the deployment.");
+
+    expect(await dialogue.close()).toBeUndefined();
+    expect(await dialogue.readStoredTranscript()).toEqual([
+      ["user", "What is the status?"],
+      ["bot", "Checking"],
+      ["user", "Check the deployment."],
+      ["bot", "Deployment is healthy"],
     ]);
   });
 
