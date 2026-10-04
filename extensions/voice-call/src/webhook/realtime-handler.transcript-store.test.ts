@@ -185,7 +185,8 @@ describe("RealtimeCallHandler stored dialogue", () => {
     expect(await dialogue.close()).toBeUndefined();
     const stored = await dialogue.readStoredTranscript();
     expect(stored).toEqual([
-      ["user", expect.stringMatching(/Final detail\.$/)],
+      // The whole utterance, not just the tail the consult buffer retains.
+      ["user", `${first}${second}`],
       ["bot", "Details received"],
       ["user", "Goodbye."],
     ]);

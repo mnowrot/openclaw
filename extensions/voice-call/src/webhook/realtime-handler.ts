@@ -172,7 +172,7 @@ function limitPartialUserTranscript(text: string): string {
  * turn whose write failed: it keeps its ledger slot so later turns still align, and the
  * final that restates it carries its text instead.
  */
-type CallerTurnCommit = { text: string; omittedPrefixChars: number; unstored?: boolean };
+type CallerTurnCommit = { text: string; unstored?: boolean };
 
 /**
  * New caller speech in an incoming final, plus how many committed turns it restated and
@@ -202,7 +202,7 @@ function compactTranscriptText(value: string): string {
 function reduceFinalCallerTranscript(
   committed: readonly CallerTurnCommit[],
   incoming: string,
-  streamedSinceCommit: { text: string; omittedPrefixChars: number },
+  streamedSinceCommit: { text: string },
 ): CallerFinalReduction {
   const source = normalizeTranscriptText(incoming);
   const whole = { residual: source, claimedTurns: 0, recovered: [] };
@@ -217,8 +217,7 @@ function reduceFinalCallerTranscript(
     indexByCompact.push(index);
   }
   const streamedCompact = compactTranscriptText(streamedSinceCommit.text);
-  const restatedLength =
-    compact.length - streamedSinceCommit.omittedPrefixChars - streamedCompact.length;
+  const restatedLength = compact.length - streamedCompact.length;
   if (restatedLength <= 0 || !compact.endsWith(streamedCompact)) {
     return whole;
   }
@@ -229,9 +228,9 @@ function reduceFinalCallerTranscript(
     if (matched === restatedLength) {
       break;
     }
-    // A bounded turn contains only its tail. Match it at the original offset so
-    // the final cannot re-store that turn or claim unrelated text by substring.
-    const start = matched + commit.omittedPrefixChars;
+    // Match each turn at its original offset so the final cannot claim
+    // unrelated text by substring.
+    const start = matched;
     const commitCompact = compactTranscriptText(commit.text);
     if (!compact.startsWith(commitCompact, start)) {
       break;
@@ -347,7 +346,6 @@ type NativeConsultOutcome = { kind: "completed"; result: unknown } | { kind: "ca
 type UserTranscriptState = {
   partial?: string;
   rawPartial?: string;
-  rawPartialOmittedPrefixChars?: number;
   partialUpdatedAt?: number;
   recentFinal?: string;
   recentFinalTimer?: ReturnType<typeof setTimeout>;
@@ -1223,10 +1221,7 @@ export class RealtimeCallHandler {
             rawPartial: state.rawPartial,
             final: text,
           });
-          const streamedSinceCommit = {
-            text: state.rawPartial ?? "",
-            omittedPrefixChars: state.rawPartialOmittedPrefixChars ?? 0,
-          };
+          const streamedSinceCommit = { text: state.rawPartial ?? "" };
           this.clearPartialUserTranscript(callId, userTranscriptOwner);
           const generation = continuityGeneration;
           // A provider that restates the call in this final has to be reduced to the
@@ -1761,14 +1756,9 @@ export class RealtimeCallHandler {
       return undefined;
     }
     const next = limitPartialUserTranscript(appendTranscriptText(state.partial, text));
-    const rawCombined = `${state.rawPartial ?? ""}${text}`;
-    const raw = limitPartialUserTranscript(rawCombined);
-    state.rawPartialOmittedPrefixChars =
-      (state.rawPartialOmittedPrefixChars ?? 0) +
-      compactTranscriptText(rawCombined).length -
-      compactTranscriptText(raw).length;
     state.partial = next;
-    state.rawPartial = raw;
+    // Only the consult buffer is bounded; the stored caller turn keeps every delta.
+    state.rawPartial = `${state.rawPartial ?? ""}${text}`;
     state.partialUpdatedAt = Date.now();
     return next;
   }
@@ -1780,7 +1770,6 @@ export class RealtimeCallHandler {
     }
     state.partial = undefined;
     state.rawPartial = undefined;
-    state.rawPartialOmittedPrefixChars = undefined;
     state.partialUpdatedAt = undefined;
   }
 
@@ -1844,7 +1833,7 @@ export class RealtimeCallHandler {
     if (!pending) {
       return undefined;
     }
-    const commit = { text: pending, omittedPrefixChars: state?.rawPartialOmittedPrefixChars ?? 0 };
+    const commit = { text: pending };
     if (state?.partial) {
       this.consumePartialUserTranscript(callId, owner, state.partial);
     }
@@ -1958,7 +1947,6 @@ export class RealtimeCallHandler {
       if (remaining) {
         state.partial = remaining;
         state.rawPartial = remaining;
-        state.rawPartialOmittedPrefixChars = 0;
       } else {
         this.clearPartialUserTranscript(callId, owner);
       }
