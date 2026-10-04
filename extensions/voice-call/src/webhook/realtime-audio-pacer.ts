@@ -330,8 +330,10 @@ export class RealtimeAudioPacer {
     }
     this.streamClockMs = (this.streamClockMs ?? performance.now()) + item.durationMs;
     if (sent) {
-      // The stream clock is the paced playout timeline; project its end onto the wall clock.
-      this.playoutEndsAt = Date.now() + Math.max(0, this.streamClockMs - performance.now());
+      // The stream clock restarts whenever the local queue drains, but the carrier keeps
+      // playing what it was already handed. Accumulate on the wall clock so rapid short
+      // bursts retain their backlog; an elapsed deadline re-anchors to now after real idle.
+      this.playoutEndsAt = Math.max(Date.now(), this.playoutEndsAt) + item.durationMs;
     }
     if (
       !sent ||
