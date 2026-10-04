@@ -101,7 +101,9 @@ describe("RealtimeCallHandler stored dialogue", () => {
       "/voice/webhook",
       noOpStreamDisconnectLifecycle,
     );
-    const { server, ws } = await connectCarrierStream(handler);
+    // The harness owns ws/server teardown via onTestFinished, so this scope must not
+    // close the carrier server itself: a second close rejects with ERR_SERVER_NOT_RUNNING.
+    const { ws } = await connectCarrierStream(handler);
     ws.send(
       JSON.stringify({
         event: "start",
@@ -118,8 +120,6 @@ describe("RealtimeCallHandler stored dialogue", () => {
           (error: unknown) => error,
         );
         order.push("close");
-        ws.terminate();
-        await server.close();
         return outcome;
       },
       gateReached: gateReached.promise,
