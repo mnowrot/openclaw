@@ -4,13 +4,6 @@ import {
   selectAcpSessionRows,
 } from "../acp/runtime/session-meta-keys.js";
 import {
-  countMcpOAuthPrincipalsInDatabase,
-  listMcpOAuthStoreKeysInDatabase,
-  readMcpOAuthPendingInDatabase,
-  readMcpOAuthStoreIfPresentInDatabase,
-  readMcpOAuthStatusesInDatabase,
-} from "../agents/mcp-oauth-store.kernel.js";
-import {
   loadSubagentMaintenanceRunsInDatabase,
   loadVersionedSubagentRunsInDatabase,
   loadSubagentRunsForSessionsInDatabase,
@@ -21,6 +14,12 @@ import {
 import { readWorkspaceStateSnapshotForDirectoryInDatabase } from "../agents/workspace-state-store.kernel.js";
 import { isChannelIngressReadCommand } from "../channels/message/ingress-queue-read-contract.js";
 import { readChannelIngressInDatabase } from "../channels/message/ingress-queue-read.worker.js";
+import {
+  readClawInstallRecordFromDatabase,
+  readClawInstallRecordsInDatabase,
+  readClawOrphanWorkspaceInDatabase,
+  readClawPackageRefsInDatabase,
+} from "../claws/provenance-read.kernel.js";
 import {
   isCronStateReadCommand,
   readCronStateCommandInDatabase,
@@ -49,14 +48,10 @@ import { readWorkerPlacementChangeSnapshotInDatabase } from "../gateway/worker-e
 import { readWorkspaceJournalInDatabase } from "../gateway/worker-environments/placement-workspace-journal.js";
 import { isWorkspaceJournalReadCommand } from "../gateway/worker-environments/placement-workspace-journal.types.js";
 import { listPendingWorkerWorkspaceResultsInDatabase } from "../gateway/worker-environments/placement-workspace-result.js";
-import {
-  readWorkerEnvironmentFacts,
-  readWorkerEnvironmentPrunePage,
-} from "../gateway/worker-environments/store-row-codec.js";
 import { getSqliteRuntimeCapabilities } from "../infra/bun-sqlite-library.js";
 import { executeDevicePairingRead } from "../infra/device-pairing-read.kernel.js";
 import { readExecApprovalsConfigRow } from "../infra/exec-approvals-sqlite.js";
-import { readGatewayOwnerLeaseFromDatabase } from "../infra/gateway-owner-lease.read.js";
+import { inspectGatewayOwnerLeaseForMaintenance } from "../infra/gateway-owner-lease.worker.js";
 import { bunSqliteNativeCleanupPending } from "../infra/node-sqlite.js";
 import { inspectCurrentConversationBindingRecordInDatabase } from "../infra/outbound/current-conversation-bindings.kernel.js";
 import { readOutboundDeliveriesInDatabase } from "../infra/outbound/delivery-queue-storage.kernel.js";
@@ -92,7 +87,6 @@ import { readGitHubPublicationSessionLifecycle } from "./github-publication-sess
 import { readOnboardingRecommendationsInDatabase } from "./onboarding-recommendations.kernel.js";
 import { readRegisteredAgentDatabaseRows } from "./openclaw-agent-db-registry.read.js";
 import { openClawStateDatabaseCache } from "./openclaw-state-db-cache.js";
-import { openDoctorStateSchemaReadAdmission } from "./openclaw-state-db-doctor-schema.js";
 import {
   closeRetainedOpenClawStateReadConnections,
   readOpenClawStateReadOnlyLocation,
@@ -104,6 +98,7 @@ import {
   isStateDiagnosticCommand,
   readStateDiagnosticCommand,
 } from "./openclaw-state-read-diagnostics.js";
+import { readMcpOAuthStateCommand } from "./openclaw-state-read-mcp-oauth.js";
 import { stateReadRegistry } from "./openclaw-state-read-operation-registry.js";
 import { readStateRegistryCommand } from "./openclaw-state-read-registry.js";
 import type {
@@ -159,12 +154,16 @@ serveOwnedWorkerTasks(
         if (command.type === "admit") {
           return { ok: true, type: "admit" };
         }
+        if (command.type === "doctor.gatewayOwnerLease.read") {
+          const lease = inspectGatewayOwnerLeaseForMaintenance(input, () => {
+            sourceAdmitted = true;
+          });
+          return { ok: true, type: command.type, sourceAdmitted: true, lease };
+        }
         const locationArgs = [
           input.databasePath,
           input.location,
-          command.type === "doctor.gatewayOwnerLease.read"
-            ? openDoctorStateSchemaReadAdmission
-            : undefined,
+          undefined,
           input.expectedIdentity,
           input.snapshotRoot,
           true,
@@ -215,8 +214,21 @@ serveOwnedWorkerTasks(
         const result = withOpenClawStateReadOnlyLocation(
           ({ db }): OpenClawStateReadResult => {
             sourceAdmitted = true;
-            if (command.type === "doctor.gatewayOwnerLease.read") {
-              return { type: command.type, lease: readGatewayOwnerLeaseFromDatabase(db) };
+            if (command.type === "claws.packageOwnership") {
+              const install =
+                command.agentId === undefined
+                  ? undefined
+                  : readClawInstallRecordFromDatabase(db, command.agentId);
+              return {
+                type: command.type,
+                install,
+                installs: command.includeInstalls ? readClawInstallRecordsInDatabase(db) : [],
+                packageRefs: readClawPackageRefsInDatabase(db, { agentId: command.agentId }),
+                orphanWorkspace:
+                  command.agentId !== undefined && !install
+                    ? readClawOrphanWorkspaceInDatabase(db, command.agentId)
+                    : undefined,
+              };
             }
             if (command.type === "agentDatabaseDeletion.snapshot") {
               return {
@@ -299,35 +311,14 @@ serveOwnedWorkerTasks(
                 runs: new Map(rows.map((entry) => [entry.runId, entry])),
               };
             }
-            if (command.type === "mcpOAuth.statuses") {
-              return {
-                type: command.type,
-                value: readMcpOAuthStatusesInDatabase(db, command.input),
-              };
-            }
-            if (command.type === "mcpOAuth.readOnly") {
-              return {
-                type: command.type,
-                value: readMcpOAuthStoreIfPresentInDatabase(db, command.input),
-              };
-            }
-            if (command.type === "mcpOAuth.keys") {
-              return {
-                type: command.type,
-                value: listMcpOAuthStoreKeysInDatabase(db, command.input),
-              };
-            }
-            if (command.type === "mcpOAuth.pending") {
-              return {
-                type: command.type,
-                value: readMcpOAuthPendingInDatabase(db, command.input),
-              };
-            }
-            if (command.type === "mcpOAuth.countPrincipals") {
-              return {
-                type: command.type,
-                value: countMcpOAuthPrincipalsInDatabase(db, command.input),
-              };
+            if (
+              command.type === "mcpOAuth.statuses" ||
+              command.type === "mcpOAuth.readOnly" ||
+              command.type === "mcpOAuth.keys" ||
+              command.type === "mcpOAuth.pending" ||
+              command.type === "mcpOAuth.countPrincipals"
+            ) {
+              return readMcpOAuthStateCommand(db, command);
             }
             if (command.type === "sessionGroups.snapshot") {
               return {
@@ -447,20 +438,6 @@ serveOwnedWorkerTasks(
               return {
                 type: command.type,
                 row: readExecApprovalsConfigRow(db),
-              };
-            }
-            if (command.type === "workerEnvironments.snapshot") {
-              return {
-                type: command.type,
-                facts: runSqliteDeferredTransactionSync(db, () =>
-                  readWorkerEnvironmentFacts(db, command.ids),
-                ),
-              };
-            }
-            if (command.type === "workerEnvironments.pruneCandidates") {
-              return {
-                type: command.type,
-                page: readWorkerEnvironmentPrunePage(db, command.input),
               };
             }
             if (command.type === "skills.library.descriptions") {

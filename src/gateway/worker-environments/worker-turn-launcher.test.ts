@@ -566,7 +566,7 @@ describe("worker turn launcher local placement", () => {
               agents: {
                 defaults: {
                   models: {
-                    "openai/gpt-test": { agentRuntime: { id: runtimeId } },
+                    "openai/gpt-5.6-luna": { agentRuntime: { id: runtimeId } },
                   },
                 },
               },
@@ -624,7 +624,7 @@ describe("worker turn launcher local placement", () => {
         if (placement?.state !== "active") {
           throw new Error("expected an active placement");
         }
-        placements.startDrain({
+        await placements.startDrain({
           sessionId: SESSION_ID,
           environmentId: placement.environmentId,
           ownerEpoch: placement.activeOwnerEpoch,

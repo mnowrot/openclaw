@@ -4,19 +4,6 @@ import type { CallMode } from "./config.js";
 import type { VoiceCallRuntime } from "./runtime.js";
 import type { CallRecord } from "./types.js";
 
-type VoiceCallStatus = Pick<
-  CallRecord,
-  | "callId"
-  | "providerCallId"
-  | "provider"
-  | "direction"
-  | "state"
-  | "startedAt"
-  | "answeredAt"
-  | "endedAt"
-  | "endReason"
->;
-
 export class VoiceCallCommandInputError extends Error {}
 
 type VoiceCallCommandRuntimeSelectors = {
@@ -25,7 +12,7 @@ type VoiceCallCommandRuntimeSelectors = {
   assertCurrentRegistration: () => void;
 };
 
-function toVoiceCallStatus(call: CallRecord): VoiceCallStatus {
+function toVoiceCallStatus(call: CallRecord) {
   return {
     callId: call.callId,
     ...(call.providerCallId !== undefined ? { providerCallId: call.providerCallId } : {}),
@@ -200,10 +187,7 @@ export function createVoiceCallCommandService({
       const rt = await ensureRuntimeForExistingCall();
       assertCurrentRegistration();
       if (!callId) {
-        return {
-          found: true,
-          calls: rt.manager.getActiveCalls().map(toVoiceCallStatus),
-        };
+        return { found: true, calls: rt.manager.getActiveCalls().map(toVoiceCallStatus) };
       }
       const call = await rt.manager.getCallFromMemoryOrStore(callId);
       assertCurrentRegistration();
