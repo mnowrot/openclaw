@@ -259,6 +259,7 @@ describe("voice-call runtime lifecycle", () => {
     const runtimeA = createRuntime("call-a", "+15550000001");
     vi.mocked(createVoiceCallRuntime).mockResolvedValue(runtimeA.runtime);
     const generationA = registerVoiceCall({ registrationMode: "full" });
+    expect(generationA.service.start(serviceContext)).toBeUndefined();
     await executeCall(generationA.tool());
     expect(runtimeA.initiateCall).toHaveBeenCalledTimes(1);
 
@@ -285,6 +286,7 @@ describe("voice-call runtime lifecycle", () => {
     });
     vi.mocked(createVoiceCallRuntime).mockResolvedValue(runtimeA.runtime);
     const generationA = registerVoiceCall({ registrationMode: "full" });
+    expect(generationA.service.start(serviceContext)).toBeUndefined();
     await executeCall(generationA.tool());
 
     const speakingA = executeGatewayCommand(generationA, "voicecall.speak", {
@@ -380,6 +382,7 @@ describe("voice-call runtime lifecycle", () => {
     );
     vi.mocked(createVoiceCallRuntime).mockResolvedValue(runtimeA.runtime);
     const generationA = registerVoiceCall({ registrationMode: "full" });
+    expect(generationA.service.start(serviceContext)).toBeUndefined();
     await executeCall(generationA.tool());
 
     const generationB = registerVoiceCall({ registrationMode: "full" });
@@ -490,6 +493,7 @@ describe("voice-call runtime lifecycle", () => {
     runtime.runtime.manager = manager;
     vi.mocked(createVoiceCallRuntime).mockResolvedValue(runtime.runtime);
     const generationB = registerVoiceCall({ registrationMode: "full" });
+    expect(generationB.service.start(serviceContext)).toBeUndefined();
     blockNextAdmissionWrite = true;
     const dialingB = executeGatewayCommand(generationB, "voicecall.initiate", {
       to: "+15550000002",
@@ -531,6 +535,7 @@ describe("voice-call runtime lifecycle", () => {
       config: { provider: "mock", toNumber: "+15550000001" },
       registrationMode: "full",
     });
+    expect(generationA.service.start(serviceContext)).toBeUndefined();
     await executeCall(generationA.tool());
     const generationB = registerVoiceCall({
       config: {
@@ -541,6 +546,7 @@ describe("voice-call runtime lifecycle", () => {
       },
       registrationMode: "full",
     });
+    expect(generationB.service.start(serviceContext)).toBeUndefined();
 
     const respond = await executeGatewayCall(generationB);
 
