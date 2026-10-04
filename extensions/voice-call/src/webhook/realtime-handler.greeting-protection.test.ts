@@ -151,22 +151,16 @@ describe("RealtimeCallHandler greeting protection", () => {
         },
         { initialMessage: "Hello, is this a good time?" },
       );
-      const { server, ws } = await connectCarrierStream(handler);
-      try {
-        ws.send(
-          JSON.stringify({
-            event: "start",
-            start: { streamSid: "MZ-greet-mute", callSid: call.providerCallId },
-          }),
-        );
-        const callbacks = await bridgeCreated.promise;
-        callbacks.onReady?.();
-        await expectCallerAudio(ws, providerAudio, "silence");
-      } finally {
-        ws.terminate();
-        await handler.close().catch(() => undefined);
-        await server.close();
-      }
+      const { ws } = await connectCarrierStream(handler);
+      ws.send(
+        JSON.stringify({
+          event: "start",
+          start: { streamSid: "MZ-greet-mute", callSid: call.providerCallId },
+        }),
+      );
+      const callbacks = await bridgeCreated.promise;
+      callbacks.onReady?.();
+      await expectCallerAudio(ws, providerAudio, "silence");
     },
     TEST_TIMEOUT_MS,
   );
@@ -188,26 +182,20 @@ describe("RealtimeCallHandler greeting protection", () => {
         },
         { initialMessage: "Hello, is this a good time?" },
       );
-      const { server, ws } = await connectCarrierStream(handler);
-      try {
-        ws.send(
-          JSON.stringify({
-            event: "start",
-            start: { streamSid: "MZ-greet-stall", callSid: call.providerCallId },
-          }),
-        );
-        const callbacks = await bridgeCreated.promise;
-        callbacks.onReady?.();
-        await expectCallerAudio(ws, providerAudio, "silence");
+      const { ws } = await connectCarrierStream(handler);
+      ws.send(
+        JSON.stringify({
+          event: "start",
+          start: { streamSid: "MZ-greet-stall", callSid: call.providerCallId },
+        }),
+      );
+      const callbacks = await bridgeCreated.promise;
+      callbacks.onReady?.();
+      await expectCallerAudio(ws, providerAudio, "silence");
 
-        // A completed greeting turn with no audio is terminal, so caller audio resumes immediately.
-        callbacks.onResponseDone?.({ status: "completed", responseId: "greeting" });
-        await expectCallerAudio(ws, providerAudio, "audio");
-      } finally {
-        ws.terminate();
-        await handler.close().catch(() => undefined);
-        await server.close();
-      }
+      // A completed greeting turn with no audio is terminal, so caller audio resumes immediately.
+      callbacks.onResponseDone?.({ status: "completed", responseId: "greeting" });
+      await expectCallerAudio(ws, providerAudio, "audio");
     },
     TEST_TIMEOUT_MS,
   );
@@ -230,7 +218,7 @@ describe("RealtimeCallHandler greeting protection", () => {
         },
         { initialMessage: "Hello, is this a good time?" },
       );
-      const { server, ws } = await connectCarrierStream(handler);
+      const { ws } = await connectCarrierStream(handler);
       const outboundFrames = observeCarrierFrames(ws);
       try {
         ws.send(
@@ -259,9 +247,6 @@ describe("RealtimeCallHandler greeting protection", () => {
       } finally {
         vi.useRealTimers();
         log.mockRestore();
-        ws.terminate();
-        await handler.close().catch(() => undefined);
-        await server.close();
       }
     },
     TEST_TIMEOUT_MS,
@@ -284,7 +269,7 @@ describe("RealtimeCallHandler greeting protection", () => {
         },
         { initialMessage: "Hello, is this a good time?" },
       );
-      const { server, ws } = await connectCarrierStream(handler);
+      const { ws } = await connectCarrierStream(handler);
       const outboundFrames = observeCarrierFrames(ws);
       try {
         ws.send(
@@ -324,9 +309,6 @@ describe("RealtimeCallHandler greeting protection", () => {
         await expectCallerAudio(ws, providerAudio, "audio");
       } finally {
         vi.useRealTimers();
-        ws.terminate();
-        await handler.close().catch(() => undefined);
-        await server.close();
       }
     },
     TEST_TIMEOUT_MS,
@@ -350,7 +332,7 @@ describe("RealtimeCallHandler greeting protection", () => {
         },
         { initialMessage: "Hello, is this a good time?" },
       );
-      const { server, ws } = await connectCarrierStream(handler);
+      const { ws } = await connectCarrierStream(handler);
       const outboundFrames = observeCarrierFrames(ws);
       try {
         ws.send(
@@ -414,9 +396,6 @@ describe("RealtimeCallHandler greeting protection", () => {
       } finally {
         vi.useRealTimers();
         log.mockRestore();
-        ws.terminate();
-        await handler.close().catch(() => undefined);
-        await server.close();
       }
     },
     TEST_TIMEOUT_MS,
@@ -441,7 +420,7 @@ describe("RealtimeCallHandler greeting protection", () => {
         },
         { initialMessage: "Hello, is this a good time?" },
       );
-      const { server, ws } = await connectCarrierStream(handler);
+      const { ws } = await connectCarrierStream(handler);
       const outboundFrames = observeCarrierFrames(ws);
       try {
         ws.send(
@@ -495,9 +474,6 @@ describe("RealtimeCallHandler greeting protection", () => {
         await expectCallerAudio(ws, providerAudio, "audio");
       } finally {
         vi.useRealTimers();
-        ws.terminate();
-        await handler.close().catch(() => undefined);
-        await server.close();
       }
     },
     TEST_TIMEOUT_MS,
@@ -520,7 +496,7 @@ describe("RealtimeCallHandler greeting protection", () => {
         },
         { initialMessage: "Hello, is this a good time?" },
       );
-      const { server, ws } = await connectCarrierStream(handler);
+      const { ws } = await connectCarrierStream(handler);
       const outboundFrames = observeCarrierFrames(ws);
       try {
         ws.send(
@@ -550,9 +526,6 @@ describe("RealtimeCallHandler greeting protection", () => {
         expect(outboundFrames.filter((frame) => frame.event === "clear")).toHaveLength(clearCount);
       } finally {
         vi.useRealTimers();
-        ws.terminate();
-        await handler.close().catch(() => undefined);
-        await server.close();
       }
     },
     TEST_TIMEOUT_MS,
