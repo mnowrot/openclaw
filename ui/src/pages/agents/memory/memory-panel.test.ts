@@ -529,7 +529,7 @@ describe.runIf(process.env.OPENCLAW_UI_MEMORY_CHROMIUM_E2E === "1")(
         content: `# Dream Diary\n\n*April 5, 2026, 3:00 AM*\n\n${agentId} owns this dream.`,
       });
       const config = {
-        agents: { entries: { main: { default: true }, support: {} } },
+        agents: { entries: { main: {}, support: {} } },
         plugins: {
           entries: {
             "memory-core": { enabled: true, config: { dreaming: { enabled: true } } },
@@ -602,7 +602,7 @@ describe.runIf(process.env.OPENCLAW_UI_MEMORY_CHROMIUM_E2E === "1")(
       const requestCount = () =>
         gateway.getRequests("doctor.memory.status").then((requests) => requests.length);
       const chooseAgent = async (name: string) => {
-        const picker = page.locator(".memory-page .agent-scope-control openclaw-agent-select");
+        const picker = page.locator(".settings-sidebar openclaw-agent-select");
         await picker.locator(".agent-select__trigger").click();
         await picker
           .locator("wa-dropdown-item[data-agent-option]")

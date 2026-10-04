@@ -26,7 +26,8 @@ describe("RealtimeCallHandler local barge-in during assistant playout", () => {
       callbacks = request;
       return createBridge(() => {}, { handleBargeIn, sendAudio });
     });
-    const { server, ws } = await connectCarrierStream(handler);
+    // connectCarrierStream owns socket, handler, and server teardown.
+    const { ws } = await connectCarrierStream(handler);
     ws.send(JSON.stringify({ event: "start", start: { streamSid, callSid: call.providerCallId } }));
     await vi.waitFor(() => expect(callbacks).toBeDefined());
     const sendMedia = (code: number) => {
@@ -55,15 +56,9 @@ describe("RealtimeCallHandler local barge-in during assistant playout", () => {
       (processEvent as ReturnType<typeof vi.fn>).mock.calls
         .filter(([event]) => event.type === "call.speech")
         .map(([event]) => (event as { transcript?: string }).transcript);
-    const close = async () => {
-      ws.terminate();
-      await handler.close();
-      await server.close();
-    };
     return {
       bridgeSendAudio: sendAudio,
       callbacks: () => callbacks,
-      close,
       handleBargeIn,
       sendFramesUnderAssistant,
       sendInboundFrames,
@@ -85,7 +80,6 @@ describe("RealtimeCallHandler local barge-in during assistant playout", () => {
       expect(harness.handleBargeIn).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
-      await harness.close();
     }
   });
 
@@ -99,7 +93,6 @@ describe("RealtimeCallHandler local barge-in during assistant playout", () => {
       await harness.sendFramesUnderAssistant(LOUD_ECHO_MULAW, 6);
       expect(harness.handleBargeIn).not.toHaveBeenCalled();
     } finally {
-      await harness.close();
     }
   });
 
@@ -116,7 +109,6 @@ describe("RealtimeCallHandler local barge-in during assistant playout", () => {
       harness.callbacks()?.onTranscript?.("user", "Stop, wrong address.", true);
       await vi.waitFor(() => expect(harness.speechTranscripts()).toEqual(["Stop, wrong address."]));
     } finally {
-      await harness.close();
     }
   });
 
@@ -134,7 +126,6 @@ describe("RealtimeCallHandler local barge-in during assistant playout", () => {
       expect(harness.handleBargeIn).toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
-      await harness.close();
     }
   });
 });

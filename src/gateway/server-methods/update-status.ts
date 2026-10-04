@@ -14,8 +14,8 @@ import {
   resolveOcmUpdateManager,
 } from "../../infra/ocm-update-client.js";
 import type { RestartSentinelPayload } from "../../infra/restart-sentinel.js";
-import { gatewayUpdateCampaign } from "../../infra/update-campaign.js";
 import { normalizeUpdateChannel } from "../../infra/update-channels.js";
+import { currentUpdateCheckLifecycle } from "../../infra/update-check-lifecycle.js";
 import {
   getUpdateRunAsync,
   getUpdateRunWithReconciliationAsync,
@@ -39,8 +39,8 @@ import { createStageTimingTracker } from "../../shared/stage-timing.js";
 import { formatControlPlaneActor, resolveControlPlaneActor } from "../control-plane-audit.js";
 import {
   getLatestUpdateRestartSentinel,
-  refreshLatestUpdateRestartSentinel,
-} from "../server-restart-sentinel.js";
+  prepareLatestUpdateRestartSentinel,
+} from "../server-update-sentinel.js";
 import type { GatewayRequestHandlers } from "./types.js";
 import { assertValidParams } from "./validation.js";
 
@@ -49,6 +49,7 @@ export const updateStatusHandlers: GatewayRequestHandlers = {
     if (!assertValidParams(params, validateUpdateStatusParams, "update.status", respond)) {
       return;
     }
+    const lifecycle = currentUpdateCheckLifecycle();
     const startedAt = areDiagnosticsEnabledForProcess() ? performance.now() : undefined;
     const timing =
       startedAt === undefined ? undefined : createStageTimingTracker(() => performance.now());
@@ -58,20 +59,23 @@ export const updateStatusHandlers: GatewayRequestHandlers = {
       phase = next;
     };
     try {
-      let manager = await resolveOcmUpdateManager().catch((error: unknown) => {
-        if (!(error instanceof OcmUpdateCapabilitiesUnsupportedError)) {
-          throw error;
-        }
-        context?.logGateway?.warn(error.message);
-        return null;
-      });
+      const immutable = lifecycle.installStatus?.status.installKind === "immutable";
+      let manager = immutable
+        ? null
+        : await resolveOcmUpdateManager().catch((error: unknown) => {
+            if (!(error instanceof OcmUpdateCapabilitiesUnsupportedError)) {
+              throw error;
+            }
+            context?.logGateway?.warn(error.message);
+            return null;
+          });
       const managedRun = manager ? await manager.status() : null;
       if (manager && !manager.canStart && !managedRun) {
         manager = null;
       }
       let sentinel: RestartSentinelPayload | null;
       try {
-        sentinel = manager ? null : await refreshLatestUpdateRestartSentinel();
+        sentinel = manager ? null : await prepareLatestUpdateRestartSentinel(undefined, lifecycle);
       } catch (err) {
         context?.logGateway?.warn(
           `update.status sentinel refresh failed: ${formatErrorMessage(err)}`,
@@ -80,7 +84,7 @@ export const updateStatusHandlers: GatewayRequestHandlers = {
       }
       mark("checkout");
       const config = context?.getRuntimeConfig?.();
-      if (params.refreshCheckout === true && config) {
+      if ((params.refreshCheckout === true || immutable) && config) {
         try {
           await refreshGatewayUpdateStatus(config);
         } catch (err) {
@@ -106,7 +110,8 @@ export const updateStatusHandlers: GatewayRequestHandlers = {
             lastRun: managedRun?.status !== "running" ? (managedRun ?? undefined) : undefined,
           }
         : await getUpdateRunStatusAsync();
-      const campaignRunId = gatewayUpdateCampaign.getRunId();
+      const campaign = lifecycle.campaign;
+      const campaignRunId = campaign?.getRunId();
       const campaignRun =
         !campaignRunId || lastRun?.runId === campaignRunId
           ? lastRun
@@ -118,7 +123,9 @@ export const updateStatusHandlers: GatewayRequestHandlers = {
                 );
                 return undefined;
               });
-      gatewayUpdateCampaign.reconcileRun(campaignRun);
+      if (lifecycle.isCurrent() && !lifecycle.signal.aborted) {
+        campaign?.reconcileRun(campaignRun);
+      }
       mark("identity");
       let currentConfig = context?.getRuntimeConfig?.() ?? config;
       let effectiveChannel =
@@ -183,11 +190,12 @@ export const updateStatusHandlers: GatewayRequestHandlers = {
       return;
     }
     const actor = resolveControlPlaneActor(client);
-    const campaignBeforeHold = gatewayUpdateCampaign.getState();
-    const ok = gatewayUpdateCampaign.hold();
+    const campaign = currentUpdateCheckLifecycle().campaign;
+    const campaignBeforeHold = campaign?.getState();
+    const ok = campaign?.hold() ?? false;
     const schedule = getUpdateSchedule();
     if (ok) {
-      const heldCampaign = gatewayUpdateCampaign.getState();
+      const heldCampaign = campaign?.getState();
       context?.logGateway?.info(
         `update.hold granted ${formatControlPlaneActor(actor)} holdUntilMs=${heldCampaign?.holdUntilMs} forceAtMs=${heldCampaign?.forceAtMs}`,
       );

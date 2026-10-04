@@ -1,8 +1,10 @@
 // Covers TUI submit handler behavior for chat input and slash commands.
 import type { TUI } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import { CustomEditor } from "./components/custom-editor.js";
 import { editorTheme } from "./theme/theme.js";
+import { createTuiCommandHandlersHarness } from "./tui-command-handlers-test-support.js";
 import { createSubmitHarness } from "./tui-submit-test-helpers.js";
 import {
   createEditorSubmitHandler,
@@ -30,6 +32,57 @@ function createRealEditorSubmitHarness(
 }
 
 describe("createEditorSubmitHandler", () => {
+  it.each([
+    { name: "no newer draft", newerDraft: "" },
+    { name: "typed text", newerDraft: "new draft" },
+    { name: "a multiline paste", newerDraft: "new draft\nmore notes" },
+    { name: "a collapsed paste", newerDraft: "x".repeat(1001) },
+  ])("restores rejected slash chat alongside $name", async ({ newerDraft }) => {
+    const handlers = createTuiCommandHandlersHarness({ isConnected: false });
+    const editor = new CustomEditor({ requestRender: vi.fn() } as unknown as TUI, editorTheme);
+    const onSubmitError = vi.fn();
+    const submit = createEditorSubmitHandler({
+      editor,
+      handleCommand: handlers.handleCommand,
+      sendMessage: handlers.sendMessage,
+      handleBangLine: vi.fn(),
+      onSubmitError,
+    });
+    vi.useFakeTimers();
+    const submitBurst = createSubmitBurstCoalescer({ submit, enabled: true });
+    editor.onSubmit = submitBurst;
+    try {
+      const draft = "/tmp/window97-note.txt";
+      editor.setText(draft);
+      editor.handleInput("\r");
+      if (newerDraft) {
+        editor.handleInput(`\u001b[200~${newerDraft}\u001b[201~`);
+      }
+      vi.advanceTimersByTime(50);
+
+      const retained = newerDraft ? `${draft}\n${newerDraft}` : draft;
+      expect(editor.getExpandedText()).toBe(retained);
+      expect(handlers.sendChat).not.toHaveBeenCalled();
+      expect(handlers.addSystem).toHaveBeenCalledExactlyOnceWith(
+        "not connected to gateway — message not sent",
+      );
+      expect(onSubmitError).not.toHaveBeenCalled();
+
+      handlers.state.isConnected = true;
+      editor.handleInput("\r");
+      vi.advanceTimersByTime(50);
+      await Promise.resolve();
+      expect(handlers.sendChat).toHaveBeenCalledTimes(1);
+      expect(handlers.sendChat).toHaveBeenCalledWith(
+        expect.objectContaining({ message: retained }),
+      );
+      expect(editor.getExpandedText()).toBe("");
+    } finally {
+      submitBurst.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it("routes genuine bang input to local shell and history", () => {
     const { editor, sendMessage, handleBangLine } = createRealEditorSubmitHarness();
     editor.setText("!cmd");
@@ -135,25 +188,6 @@ describe("createEditorSubmitHandler", () => {
     expect(editor.getText()).toBe("hello");
   });
 
-  it("preserves normal message drafts when chat is busy", () => {
-    const { editor, sendMessage, handleCommand, handleBangLine, onBlockedMessageSubmit, onSubmit } =
-      createSubmitHarness({
-        admitMessage: () => ({ status: "blocked", reason: "pending" }),
-      });
-
-    onSubmit("  wait, use c++ instead  ");
-
-    expect(editor.setText).toHaveBeenCalledWith("wait, use c++ instead");
-    expect(editor.addToHistory).not.toHaveBeenCalled();
-    expect(sendMessage).not.toHaveBeenCalled();
-    expect(handleCommand).not.toHaveBeenCalled();
-    expect(handleBangLine).not.toHaveBeenCalled();
-    expect(onBlockedMessageSubmit).toHaveBeenCalledWith("wait, use c++ instead", {
-      status: "blocked",
-      reason: "pending",
-    });
-  });
-
   it("passes the submitted text to the busy gate", () => {
     const admitMessage = vi.fn((value: string) =>
       value === "please stop"
@@ -172,13 +206,15 @@ describe("createEditorSubmitHandler", () => {
     const tui = { requestRender: vi.fn() } as unknown as TUI;
     const editor = new CustomEditor(tui, editorTheme);
     const sendMessage = vi.fn();
+    const handleCommand = vi.fn();
+    const handleBangLine = vi.fn();
     const onBlockedMessageSubmit = vi.fn();
-    editor.setText("wait, use c++ instead");
+    editor.setText("  wait, use c++ instead  ");
     editor.onSubmit = createEditorSubmitHandler({
       editor,
-      handleCommand: vi.fn(),
+      handleCommand,
       sendMessage,
-      handleBangLine: vi.fn(),
+      handleBangLine,
       onSubmitError: vi.fn(),
       admitMessage: () => ({ status: "blocked", reason: "pending" }),
       onBlockedMessageSubmit,
@@ -188,10 +224,16 @@ describe("createEditorSubmitHandler", () => {
 
     expect(editor.getText()).toBe("wait, use c++ instead");
     expect(sendMessage).not.toHaveBeenCalled();
-    expect(onBlockedMessageSubmit).toHaveBeenCalledWith("wait, use c++ instead", {
+    expect(handleCommand).not.toHaveBeenCalled();
+    expect(handleBangLine).not.toHaveBeenCalled();
+    expect(onBlockedMessageSubmit).toHaveBeenCalledWith({
       status: "blocked",
       reason: "pending",
     });
+
+    editor.setText("");
+    editor.handleInput("\u001b[A");
+    expect(editor.getText()).toBe("");
   });
 
   it("continues to route slash commands while chat is busy", () => {
@@ -203,7 +245,7 @@ describe("createEditorSubmitHandler", () => {
     onSubmit("/abort");
 
     expect(editor.setText).toHaveBeenCalledWith("");
-    expect(handleCommand).toHaveBeenCalledWith("/abort");
+    expect(handleCommand).toHaveBeenCalledWith("/abort", expect.any(Function));
     expect(sendMessage).not.toHaveBeenCalled();
     expect(onBlockedMessageSubmit).not.toHaveBeenCalled();
   });
@@ -418,4 +460,87 @@ describe("shouldEnableWindowsGitBashPasteFallback", () => {
       }),
     ).toBe(false);
   });
+});
+
+describe("session transition submit admission", () => {
+  it.each([
+    { command: "new", capture: "before" },
+    { command: "reset", capture: "during" },
+  ] as const)(
+    "keeps a submit captured $capture /$command blocked across the transition epoch",
+    async ({ command, capture }) => {
+      vi.useFakeTimers();
+      try {
+        const transitionResult = createDeferred<{
+          ok: true;
+          key: string;
+          entry: { sessionId: string };
+        }>();
+        const createSession = vi.fn(() => transitionResult.promise);
+        const resetSession = vi.fn(() => transitionResult.promise);
+        const applySessionMutationResult = vi.fn().mockReturnValue(true);
+        const harness = createTuiCommandHandlersHarness({
+          createSession,
+          resetSession,
+          applySessionMutationResult,
+        });
+        const editor = {
+          getText: vi.fn(() => ""),
+          getExpandedText: vi.fn(() => ""),
+          setText: vi.fn(),
+          addToHistory: vi.fn(),
+        };
+        const submit = createEditorSubmitHandler({
+          editor,
+          handleCommand: harness.handleCommand,
+          sendMessage: harness.sendMessage,
+          handleBangLine: vi.fn(),
+          onSubmitError: vi.fn(),
+          admitMessage: harness.resolveMessageAdmission,
+          onBlockedMessageSubmit: harness.reportBlockedMessageSubmit,
+        });
+        const bufferedSubmit = createSubmitBurstCoalescer({
+          submit,
+          captureSnapshot: harness.captureMessageAdmission,
+          enabled: true,
+          burstWindowMs: 50,
+        });
+
+        if (capture === "before") {
+          bufferedSubmit("must remain in the editor");
+        }
+        const transitioning = harness.handleCommand(`/${command}`);
+        await Promise.resolve();
+        expect(command === "new" ? createSession : resetSession).toHaveBeenCalledOnce();
+
+        if (capture === "during") {
+          bufferedSubmit("must remain in the editor");
+        }
+        transitionResult.resolve({
+          ok: true,
+          key: command === "new" ? "agent:main:tui-next" : "agent:main:main",
+          entry: { sessionId: `session-after-${command}` },
+        });
+        await transitioning;
+        expect(harness.captureMessageAdmission()).toEqual({
+          historyLoaded: true,
+          sessionTransition: null,
+          sessionTransitionEpoch: 2,
+        });
+        expect(harness.resolveMessageAdmission("live admission is clear")).toEqual({
+          status: "allowed",
+        });
+
+        vi.advanceTimersByTime(50);
+
+        expect(harness.sendChat).not.toHaveBeenCalled();
+        expect(editor.setText).toHaveBeenCalledWith("must remain in the editor");
+        expect(harness.addSystem).toHaveBeenCalledWith(
+          `session change in progress; wait for /${command} to finish`,
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 });

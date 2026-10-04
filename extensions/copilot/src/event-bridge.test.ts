@@ -1,29 +1,10 @@
 import type { SessionEvent } from "@github/copilot-sdk";
 // Copilot tests cover event bridge plugin behavior.
 import { expectDefined } from "@openclaw/normalization-core";
-import type {
-  AgentHarnessTaskRecord,
-  AgentHarnessTaskRuntime,
-  AgentHarnessTaskRuntimeScope,
-} from "openclaw/plugin-sdk/agent-harness-task-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { attachEventBridge, type SessionLike } from "./event-bridge.js";
 import { registerCopilotToolEventTests } from "./event-bridge.tools.test-support.js";
-import { createCopilotNativeSubagentTaskMirror } from "./native-subagent-task-mirror.js";
-
-const nativeTaskRuntime = vi.hoisted<{
-  current?: Pick<
-    AgentHarnessTaskRuntime,
-    "tryCreateRunningTaskRun" | "finalizeTaskRunByRunId" | "listTaskRecords"
-  >;
-}>(() => ({}));
-
-vi.mock("openclaw/plugin-sdk/agent-harness-task-runtime", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("openclaw/plugin-sdk/agent-harness-task-runtime")>();
-  return { ...actual, createAgentHarnessTaskRuntime: () => nativeTaskRuntime.current };
-});
 
 const MODEL_REF = {
   api: "openai-responses",
@@ -64,30 +45,18 @@ function makeAssistantMessageEvent(
 
 function createFakeSession(
   options: {
-    onOff?: (eventType: string) => void;
     onReturnedUnsubscribe?: (eventType: string) => void;
-    returnUnsubscribe?: boolean;
   } = {},
 ): FakeSession {
   const listeners = new Map<string, Array<(event: SessionEvent) => void>>();
-  const returnUnsubscribe = options.returnUnsubscribe !== false;
-
-  const off = vi.fn((eventType: string, handler: (event: SessionEvent) => void) => {
-    options.onOff?.(eventType);
-    listeners.set(
-      eventType,
-      (listeners.get(eventType) ?? []).filter((existing) => existing !== handler),
-    );
-  });
-
   const on = vi.fn((eventType: string, handler: (event: SessionEvent) => void) => {
     listeners.set(eventType, [...(listeners.get(eventType) ?? []), handler]);
-    if (!returnUnsubscribe) {
-      return undefined;
-    }
     return () => {
       options.onReturnedUnsubscribe?.(eventType);
-      off(eventType, handler);
+      listeners.set(
+        eventType,
+        (listeners.get(eventType) ?? []).filter((existing) => existing !== handler),
+      );
     };
   });
 
@@ -103,7 +72,6 @@ function createFakeSession(
     listenerCount(eventType: string) {
       return listeners.get(eventType)?.length ?? 0;
     },
-    off,
     on,
     send: vi.fn().mockResolvedValue("sdk-user"),
     sendAndWait: vi.fn().mockResolvedValue(undefined),
@@ -127,98 +95,6 @@ afterEach(() => {
 });
 
 describe("attachEventBridge", () => {
-  it.each([
-    { terminal: "subagent.completed", failureMode: "empty" },
-    { terminal: "subagent.failed", failureMode: "throw" },
-  ] as const)(
-    "retries the original $terminal result after a swallowed $failureMode callback",
-    async ({ terminal, failureMode }) => {
-      const session = createFakeSession();
-      let now = 100;
-      let task: AgentHarnessTaskRecord | undefined;
-      let attempts = 0;
-      nativeTaskRuntime.current = {
-        tryCreateRunningTaskRun(params) {
-          task = {
-            taskId: "owned-task",
-            runId: params.runId,
-            runtime: "subagent",
-            taskKind: "copilot-native",
-            requesterSessionKey: "agent:parent:session",
-            ownerKey: "agent:parent:session",
-            scopeKind: "session",
-            task: params.task,
-            status: "running",
-            deliveryStatus: "not_applicable",
-            notifyPolicy: "silent",
-            createdAt: now,
-          };
-          return task;
-        },
-        finalizeTaskRunByRunId(params) {
-          attempts += 1;
-          if (attempts === 1) {
-            if (failureMode === "throw") {
-              throw new Error("store unavailable");
-            }
-            return [];
-          }
-          task = {
-            ...expectDefined(task, "persisted native task"),
-            status: params.status,
-            endedAt: params.endedAt,
-            lastEventAt: params.lastEventAt,
-            error: params.error,
-            terminalSummary: params.terminalSummary ?? undefined,
-          };
-          return [task];
-        },
-        listTaskRecords: () => (task ? [task] : []),
-      };
-      const mirror = expectDefined(
-        createCopilotNativeSubagentTaskMirror({
-          now: () => now,
-          scope: {} as AgentHarnessTaskRuntimeScope,
-        }),
-        "native task mirror",
-      );
-      const bridge = attachEventBridge(session, {
-        getSdkSessionId: () => "sdk-session-id",
-        isAborted: () => false,
-        onNativeSubagentEvent: (event) => mirror.handleEvent(event),
-      });
-      const data = {
-        agentDescription: "inspect",
-        agentDisplayName: "Researcher",
-        agentName: "researcher",
-        toolCallId: "call-1",
-      };
-      session.emit("subagent.started", makeEvent("subagent.started", data));
-      session.emit(
-        terminal,
-        makeEvent(terminal, { ...data, error: "child failed", totalTokens: 30 }),
-      );
-      expect(task?.status).toBe("running");
-      expect(attempts).toBe(1);
-      bridge.detach();
-      now = 200;
-      mirror.finalizeActiveRuns();
-      expect(task).toMatchObject({
-        status: terminal === "subagent.completed" ? "succeeded" : "failed",
-        endedAt: 100,
-        lastEventAt: 100,
-        error: terminal === "subagent.failed" ? "child failed" : undefined,
-        terminalSummary:
-          terminal === "subagent.completed"
-            ? "Subagent completed (30 tokens)."
-            : "Subagent failed.",
-      });
-      await session.disconnect();
-      mirror.finalizeActiveRuns();
-      expect(attempts).toBe(2);
-    },
-  );
-
   it("ignores child assistant and usage events but keeps child tool side effects", async () => {
     const session = createFakeSession();
     const onAssistantDelta = vi.fn();
@@ -649,25 +525,6 @@ describe("attachEventBridge", () => {
     });
   });
 
-  it("forwards native Copilot subagent lifecycle events to the adapter", () => {
-    const session = createFakeSession();
-    const onNativeSubagentEvent = vi.fn();
-    const bridge = attachTestBridge(session, {
-      onNativeSubagentEvent,
-    });
-    const event = makeEvent("subagent.started", {
-      agentDescription: "inspect the repository",
-      agentDisplayName: "Researcher",
-      agentName: "researcher",
-      toolCallId: "call-1",
-    });
-
-    session.emit("subagent.started", event);
-
-    expect(onNativeSubagentEvent).toHaveBeenCalledWith(event);
-    bridge.detach();
-  });
-
   it("replaces prior usage and terminal token fallback with an invalid usage zero snapshot", () => {
     const session = createFakeSession();
     const bridge = attachTestBridge(session);
@@ -1049,17 +906,18 @@ describe("attachEventBridge", () => {
     bridge.detach();
 
     expect(order).toEqual(registeredEvents.toReversed());
-    expect(session.off).toHaveBeenCalledTimes(registeredEvents.length);
     expect(session.listenerCount("assistant.message_delta")).toBe(0);
   });
 
-  it("detach unsubscribes in reverse order via off() fallback", () => {
+  it("detaches remaining listeners in reverse order when a disposer throws", () => {
     const order: string[] = [];
     const session = createFakeSession({
-      onOff: (eventType) => {
+      onReturnedUnsubscribe: (eventType) => {
         order.push(eventType);
+        if (eventType === "session.error") {
+          throw new Error("unsubscribe failed");
+        }
       },
-      returnUnsubscribe: false,
     });
     const bridge = attachTestBridge(session);
 

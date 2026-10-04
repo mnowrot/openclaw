@@ -1,5 +1,4 @@
 import { applyToolAvailabilityDescriptions } from "../../agents/agent-tools.deferred-followup.js";
-// Skill tool dispatch routes runtime skill tool calls through the active session context.
 import { resolveEffectiveToolPolicy } from "../../agents/agent-tools.policy.js";
 import type { AnyAgentTool } from "../../agents/agent-tools.types.js";
 import type { createOpenClawTools } from "../../agents/openclaw-tools.js";
@@ -62,6 +61,7 @@ export function resolveSkillDispatchTools(
     cfg: OpenClawConfig;
     agentId: string;
     agentDir?: string;
+    authProfileStoreSource?: boolean;
     sessionEntry?: SessionEntry;
     sessionKey: string;
     workspaceDir: string;
@@ -179,6 +179,7 @@ export function resolveSkillDispatchTools(
     agentGroupSpace: params.sessionEntry?.space,
     agentMemberRoleIds: params.message.memberRoleIds,
     agentDir: params.agentDir,
+    authProfileStoreSource: params.authProfileStoreSource,
     workspaceDir: params.workspaceDir,
     config: params.cfg,
     sessionConfigSource: "runtime",
@@ -200,7 +201,7 @@ export function resolveSkillDispatchTools(
   });
   const policyFiltered = applyToolPolicyPipeline({
     tools,
-    toolMeta: (tool) => getPluginToolMeta(tool),
+    toolMeta: getPluginToolMeta,
     warn: logVerbose,
     steps: [
       ...buildDefaultToolPolicyPipelineSteps({
@@ -232,8 +233,10 @@ export function resolveSkillDispatchTools(
   if (explicitPolicyList.some(hasRestrictiveAllowPolicy)) {
     replaceWithEffectiveToolAllowlist(inheritedToolAllowlist, policyFiltered);
   }
-  replaceWithEffectiveCronCreatorToolAllowlist(cronCreatorToolAllowlist, policyFiltered, (tool) =>
-    getPluginToolMeta(tool),
+  replaceWithEffectiveCronCreatorToolAllowlist(
+    cronCreatorToolAllowlist,
+    policyFiltered,
+    getPluginToolMeta,
   );
   return applyToolAvailabilityDescriptions(
     filterRequesterYieldTools(policyFiltered, params.sessionKey),
