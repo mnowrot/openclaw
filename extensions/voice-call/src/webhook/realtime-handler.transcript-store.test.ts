@@ -10,8 +10,16 @@ import {
   createBridge,
   createRealtimeConfig,
   makeRealtimeProvider,
-  noOpStreamDisconnectLifecycle,
 } from "./realtime-handler.lifecycle.test-helpers.js";
+import type { StreamDisconnectLifecycle } from "./stream-disconnect-grace.js";
+
+// The lifecycle harness keeps its own no-op disconnect lifecycle module-private,
+// so this test supplies its own rather than importing the helper's binding.
+const noOpStreamDisconnectLifecycle: StreamDisconnectLifecycle = {
+  connect: () => {},
+  disconnect: () => {},
+  retire: () => {},
+};
 
 /**
  * These cases read the persisted transcript rather than the manager mock, because
