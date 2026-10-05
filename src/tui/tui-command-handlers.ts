@@ -716,10 +716,6 @@ export function createCommandHandlers(context: CommandHandlerContext) {
       );
     },
     activation: async (args) => {
-      if (!args) {
-        chatLog.addSystem("usage: /activation <mention|always>");
-        return;
-      }
       const activation = normalizeGroupActivation(args);
       if (!activation) {
         chatLog.addSystem("usage: /activation <mention|always>");
@@ -1053,8 +1049,6 @@ export function createCommandHandlers(context: CommandHandlerContext) {
     openModelSelector,
     openAgentSelector,
     openSessionSelector,
-    openSettings,
-    setAgent,
   };
 }
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

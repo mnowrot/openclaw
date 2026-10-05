@@ -9,7 +9,11 @@ import {
 } from "../../../media/media-facts.js";
 import { getGlobalHookRunner } from "../../../plugins/hook-runner-global.js";
 import type { PluginMetadataSnapshot } from "../../../plugins/plugin-metadata-snapshot.types.js";
-import { isMainSessionRestartRecoveryInputProvenance } from "../../../sessions/input-provenance.js";
+import {
+  isMainSessionRestartRecoveryInputProvenance,
+  normalizeInputProvenance,
+  shouldPreserveUserFacingSessionStateForInputProvenance,
+} from "../../../sessions/input-provenance.js";
 import type { PersistedUserTurnMessage } from "../../../sessions/user-turn-transcript.types.js";
 import { createPreparedEmbeddedAgentSettingsManager } from "../../agent-project-settings.js";
 import {
@@ -56,7 +60,10 @@ import { buildAfterTurnRuntimeContext } from "./attempt-prompt-helpers.js";
 import { resolveExistingAttemptTranscriptState } from "./attempt-transcript-helpers.js";
 import type { EmbeddedAttemptTranscriptLifecycle } from "./attempt-transcript-lifecycle.js";
 import { createUserTranscriptContextRegistry } from "./attempt-user-transcript-context-registry.js";
-import { installMessageToolOnlyTerminalHook } from "./message-tool-terminal.js";
+import {
+  installMessageToolOnlyTerminalHook,
+  installToolAuthoredSourceReplyTerminalHook,
+} from "./message-tool-terminal.js";
 import {
   type InitialUserTurnReplayPreparation,
   preparePersistedCurrentUserTurn,
@@ -250,6 +257,10 @@ export async function prepareEmbeddedAttemptAgentSession(input: {
     hasRepliedRef: attempt.hasRepliedRef,
     sessionKey: attempt.sessionKey,
   });
+  installToolAuthoredSourceReplyTerminalHook({
+    agent: activeSession.agent,
+    sourceReplyCapableToolNames: clientToolRuntime.sourceReplyCapableToolNames,
+  });
   input.markStage("agent-session");
 
   return {
@@ -342,7 +353,16 @@ export async function prepareEmbeddedAttemptSessionBoundary(input: {
       durableUserTurnMessage: orphanRepairCandidate?.messageEntry.message,
       userTurnAlreadyPersisted: attempt.userTurnTranscriptRecorder?.hasPersisted() === true,
     });
-  const orphanRepair = reconciledCurrentUser ? undefined : orphanRepairCandidate;
+  const orphanProvenance = normalizeInputProvenance(
+    orphanRepairCandidate?.messageEntry.message.provenance,
+  );
+  // A failed user dispatch can leave the next continuation an unanswered user.
+  // Keep that input in user history instead of reclassifying it as announcement context.
+  const preserveUnansweredUser =
+    shouldPreserveUserFacingSessionStateForInputProvenance(attempt.inputProvenance) &&
+    (!orphanProvenance || orphanProvenance.kind === "external_user");
+  const orphanRepair =
+    reconciledCurrentUser || preserveUnansweredUser ? undefined : orphanRepairCandidate;
   if (orphanRepair?.removeLeaf) {
     const repairedTarget = await withSessionManagerWrite(sessionManager, async () => {
       input.abortSignal?.throwIfAborted();

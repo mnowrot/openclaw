@@ -324,8 +324,12 @@ serveOwnedWorkerTasks(
         const { readSessionEntryList } = await import("./session-entry-read.worker.js");
         return {
           kind: "session-entry-list" as const,
-          entries: readSessionEntryList(request),
+          ...readSessionEntryList(request),
         };
+      }
+      if (request.kind === "session-store-projection") {
+        const { readSessionStoreProjection } = await import("./session-entry-read.worker.js");
+        return readSessionStoreProjection(request);
       }
       if (request.kind === "session-store-summary") {
         const { readSessionStoreSummaryReadOnly } =
@@ -341,6 +345,11 @@ serveOwnedWorkerTasks(
             request,
           ),
         };
+      }
+      if (request.kind === "voice-sessions") {
+        const { readOpenVoiceSessions } =
+          await import("../../talk/client-voice-session-lookup.worker.js");
+        return readOpenVoiceSessions({ ...request.database, env: request.env }, request.request);
       }
       if (request.kind === "usage-cache") {
         const { readSessionCostUsageCache } =

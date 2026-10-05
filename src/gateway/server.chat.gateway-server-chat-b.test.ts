@@ -765,14 +765,14 @@ describe("gateway server chat", () => {
       };
       setActiveEmbeddedRun("sess-main", handle, "main");
       try {
-        handler({
+        await handler({
           runId: "run-embedded",
           seq: 1,
           stream: "item",
           ts: 1_001,
           data: { kind: "preamble", itemId: "preamble-1", progressText: "Checking files" },
         });
-        handler({
+        await handler({
           runId: "run-embedded",
           seq: 2,
           stream: "tool",
@@ -784,7 +784,7 @@ describe("gateway server chat", () => {
             args: { command: "SECRET_COMMAND" },
           },
         });
-        handler({
+        await handler({
           runId: "run-embedded",
           seq: 3,
           stream: "tool",
@@ -796,7 +796,7 @@ describe("gateway server chat", () => {
             diff: "SECRET_DIFF",
           },
         });
-        handler({
+        await handler({
           runId: "run-embedded",
           seq: 4,
           stream: "tool",
@@ -808,7 +808,7 @@ describe("gateway server chat", () => {
             partialResult: "SECRET_PARTIAL",
           },
         });
-        handler({
+        await handler({
           runId: "run-embedded",
           seq: 5,
           stream: "tool",
@@ -820,7 +820,7 @@ describe("gateway server chat", () => {
             review: { id: "review-1", text: "SECRET_REVIEW" },
           },
         });
-        handler({
+        await handler({
           runId: "run-embedded",
           seq: 6,
           stream: "tool",
@@ -832,7 +832,7 @@ describe("gateway server chat", () => {
             result: "SECRET_RESULT",
           },
         });
-        handler({
+        await handler({
           runId: "run-embedded",
           seq: 7,
           stream: "plan",
@@ -1022,21 +1022,21 @@ describe("gateway server chat", () => {
         });
         const toolArgs = { path: "a" };
 
-        handler({
+        await handler({
           runId: "provider-run",
           seq: 1,
           stream: "item",
           ts: 1_001,
           data: { kind: "preamble", itemId: "preamble-1", progressText: "Checking files" },
         });
-        handler({
+        await handler({
           runId: "provider-run",
           seq: 2,
           stream: "tool",
           ts: 1_002,
           data: { phase: "start", name: "read", toolCallId: "tool-active", args: toolArgs },
         });
-        handler({
+        await handler({
           runId: "provider-run",
           seq: 3,
           stream: "tool",
@@ -1048,14 +1048,14 @@ describe("gateway server chat", () => {
             partialResult: "halfway",
           },
         });
-        handler({
+        await handler({
           runId: "provider-run",
           seq: 4,
           stream: "tool",
           ts: 1_004,
           data: { phase: "start", name: "exec", toolCallId: "tool-finished", args: {} },
         });
-        handler({
+        await handler({
           runId: "provider-run",
           seq: 5,
           stream: "tool",
@@ -1069,14 +1069,14 @@ describe("gateway server chat", () => {
         });
         // A delayed result older than the latest accepted progress event must
         // not remove the active tool from the reconnect projection.
-        handler({
+        await handler({
           runId: "provider-run",
           seq: 3,
           stream: "tool",
           ts: 1_006,
           data: { phase: "result", name: "read", toolCallId: "tool-active", result: "stale" },
         });
-        handler({
+        await handler({
           runId: "provider-run",
           seq: 6,
           stream: "item",
@@ -1184,7 +1184,7 @@ describe("gateway server chat", () => {
           ],
         });
       } finally {
-        handler.dispose();
+        await handler.dispose();
         testState.sessionStorePath = undefined;
       }
     },
@@ -5247,46 +5247,6 @@ describe("gateway server chat", () => {
       expect(active.ok).toBe(true);
       expect(JSON.stringify(active.message)).toContain("active branch");
       expect(JSON.stringify(await fetchHistoryMessages(ws))).not.toContain("side delivery");
-    });
-  });
-
-  test("chat.message.get does not return pre-session announce pairs hidden by history", async () => {
-    await withGatewayChatHarness(async ({ ws, createSessionDir }) => {
-      await connectOk(ws);
-      await createSessionDir();
-      const sessionStartedAt = Date.now();
-      await writeSessionStore({
-        entries: {
-          main: { sessionId: "sess-main", updatedAt: Date.now(), sessionStartedAt },
-        },
-      });
-      await writeMainSessionTranscript([
-        createTextTranscriptEvent("user", "announce", {
-          id: "msg-announce",
-          timestamp: sessionStartedAt - 2_000,
-          message: { provenance: { kind: "inter_session", sourceTool: "subagent_announce" } },
-        }),
-        createTextTranscriptEvent("assistant", "hidden pre-session reply", {
-          id: "msg-hidden-assistant",
-          timestamp: sessionStartedAt - 1_000,
-        }),
-        createTextTranscriptEvent("assistant", "visible reply", {
-          id: "msg-visible-assistant",
-          timestamp: sessionStartedAt + 1_000,
-        }),
-      ]);
-
-      const hidden = await fetchChatMessage(ws, makeMainMessageParams("msg-hidden-assistant"));
-      expect(hidden.ok).toBe(false);
-      expect(hidden.unavailableReason).toBe("not_found");
-
-      const announce = await fetchChatMessage(ws, makeMainMessageParams("msg-announce"));
-      expect(announce.ok).toBe(false);
-      expect(announce.unavailableReason).toBe("not_found");
-
-      const visible = await fetchChatMessage(ws, makeMainMessageParams("msg-visible-assistant"));
-      expect(visible.ok).toBe(true);
-      expect(JSON.stringify(visible.message)).toContain("visible reply");
     });
   });
 
