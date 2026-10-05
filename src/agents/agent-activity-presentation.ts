@@ -3,15 +3,29 @@ import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/st
 import { groupToolCalls, type ToolCallIdentity } from "../chat/tool-call-grouping.js";
 import { isAgentPlanProgressToolName } from "../session-cards/progress-card-input.js";
 
-/** Only recorded, unambiguous children replace a successfully completed wrapper. */
+/** Only recorded, visible children replace a successfully completed wrapper. */
 export function resolveCompletedActivityWrappers<
-  Call extends ToolCallIdentity & { activity?: { status?: string } },
+  Call extends ToolCallIdentity & {
+    activity?: {
+      status?: string;
+      hideFromChannelProgress?: boolean;
+      suppressChannelProgress?: boolean;
+    };
+  },
 >(calls: readonly Call[]): Set<Call> {
   const wrappers = new Set<Call>();
   const pending = groupToolCalls(calls);
   while (pending.length > 0) {
     const group = pending.pop()!;
-    if (group.children.length > 0 && group.card.activity?.status === "completed") {
+    if (
+      group.card.activity?.status === "completed" &&
+      group.children.some(
+        ({ card }) =>
+          card.activity &&
+          !card.activity.hideFromChannelProgress &&
+          !card.activity.suppressChannelProgress,
+      )
+    ) {
       wrappers.add(group.card);
     }
     for (const child of group.children) {
@@ -88,7 +102,7 @@ export function summarizeAgentActivity(
   const outcomes = { failed: 0, blocked: 0, skipped: 0, unknown: 0 };
   let total = 0;
   for (const item of operations.values()) {
-    if (item.hideFromChannelProgress || item.suppressChannelProgress) {
+    if (item.hideFromChannelProgress) {
       continue;
     }
     // Prepared names describe operations, not successful effects or distinct

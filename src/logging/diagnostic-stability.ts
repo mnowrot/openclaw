@@ -4,6 +4,10 @@ import {
   type DiagnosticMemoryUsage,
 } from "../infra/diagnostic-events.js";
 import {
+  DIAGNOSTIC_MEMORY_PRESSURE_METRICS,
+  type DiagnosticMemoryPressureMetrics,
+} from "../infra/diagnostic-process-types.js";
+import {
   DEFAULT_DIAGNOSTIC_STABILITY_CAPACITY,
   normalizeDiagnosticStabilityQuery,
 } from "./diagnostic-stability-query.js";
@@ -19,7 +23,7 @@ const LIVENESS_EVENT_LOOP_DELAY_WARN_MS = 1_000;
 const SAFE_REASON_CODE = /^[A-Za-z0-9_.:-]{1,120}$/u;
 const SAFE_EXPORTER_CODE = /^[A-Za-z0-9_-]{1,120}$/u;
 
-export type DiagnosticStabilityEventRecord = {
+export type DiagnosticStabilityEventRecord = DiagnosticMemoryPressureMetrics & {
   seq: number;
   ts: number;
   type: DiagnosticEventPayload["type"];
@@ -58,10 +62,6 @@ export type DiagnosticStabilityEventRecord = {
   costUsd?: number;
   count?: number;
   bytes?: number;
-  limitBytes?: number;
-  thresholdBytes?: number;
-  rssGrowthBytes?: number;
-  windowMs?: number;
   eventLoopDelayP99Ms?: number;
   eventLoopDelayMaxMs?: number;
   eventLoopUtilization?: number;
@@ -249,7 +249,9 @@ function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabi
     case "gateway.event_loop.sample":
     case "diagnostic.gc":
     case "diagnostic.child_process.spawn":
-      // Runtime measurements are exporter-only and excluded by the subscription.
+    case "log.record":
+    case "telemetry.exporter":
+      // These events use separate exporters and are excluded by the subscription.
       break;
     case "model.usage":
       copy(event, "channel", "provider", "model");
@@ -485,10 +487,6 @@ function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabi
         }
       }
       break;
-    case "log.record":
-      record.level = event.level;
-      record.source = event.loggerName;
-      break;
     case "security.event":
       record.source = event.category;
       copy(event, "action", "outcome");
@@ -503,17 +501,11 @@ function sanitizeDiagnosticEvent(event: DiagnosticEventPayload): DiagnosticStabi
       record.level = event.level;
       assignReasonCode(record, event.reason);
       record.memory = { ...event.memory };
-      copy(event, "thresholdBytes", "rssGrowthBytes", "windowMs");
+      copy(event, ...DIAGNOSTIC_MEMORY_PRESSURE_METRICS);
       break;
     case "payload.large":
       copy(event, "surface", "action", "bytes", "limitBytes", "count", "channel", "pluginId");
       assignReasonCode(record, event.reason);
-      break;
-    case "telemetry.exporter":
-      record.source = copyExporterCode(event.exporter);
-      record.target = event.signal;
-      record.outcome = event.status;
-      assignReasonCode(record, event.reason ?? event.errorCategory);
       break;
     case "diagnostic.async_queue.dropped":
       copy(
